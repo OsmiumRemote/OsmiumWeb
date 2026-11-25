@@ -1,0 +1,832 @@
+const SESSION_COOKIE = "osmium_web_sid";
+const DEVICE_COOKIE = "osmium_web_did";
+const CHALLENGE_COOKIE = "osmium_web_ch";
+const OAUTH_COOKIE = "osmium_web_oa";
+const SESSION_MAX_AGE_SEC = 30 * 24 * 60 * 60;
+const DEVICE_MAX_AGE_SEC = 365 * 24 * 60 * 60;
+const PENDING_MAX_AGE_SEC = 10 * 60;
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+let cachedKeySecret = "";
+let cachedAesKey = null;
+
+function baseSecurityHeaders(signalingOrigin) {
+    let wsOrigin = "wss://osmium.fufu.skin";
+    let httpsOrigin = "https://osmium.fufu.skin";
+    try {
+        const u = new URL(signalingOrigin || "https://osmium.fufu.skin");
+        httpsOrigin = u.origin;
+        wsOrigin = (u.protocol === "http:" ? "ws://" : "wss://") + u.host;
+    } catch {}
+    const csp = [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self'",
+        `img-src 'self' data: blob: ${httpsOrigin}`,
+        `connect-src 'self' ${wsOrigin}`,
+        "worker-src 'self' blob:",
+        "font-src 'self'",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'self'"
+    ].join("; ");
+    return {
+        "Content-Security-Policy": csp,
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+        "Permissions-Policy": "camera=(), geolocation=(), payment=(), usb=()"
+    };
+}
+
+function toBase64Url(bytes) {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function fromBase64Url(str) {
+    if (typeof str !== "string" || !str || !/^[A-Za-z0-9_-]+$/.test(str)) return null;
+    const pad = str.length % 4 === 0 ? "" : "=".repeat(4 - (str.length % 4));
+    const b64 = str.replace(/-/g, "+").replace(/_/g, "/") + pad;
+    try {
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+    } catch {
+        return null;
+    }
+}
+
+function randomBase64Url(len) {
+    const buf = new Uint8Array(len);
+    crypto.getRandomValues(buf);
+    return toBase64Url(buf);
+}
+
+function generateNumericDeviceId() {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    const num = 100000000 + (buf[0] % 900000000);
+    return String(num);
+}
+
+function timingSafeEqual(a, b) {
+    if (typeof a !== "string" || typeof b !== "string") return false;
+    const ba = enc.encode(a);
+    const bb = enc.encode(b);
+    if (ba.length !== bb.length) return false;
+    let diff = 0;
+    for (let i = 0; i < ba.length; i++) diff |= ba[i] ^ bb[i];
+    return diff === 0;
+}
+
+async function getCookieAesKey(env) {
+    const secret = String(env.WEB_COOKIE_SECRET || "").trim();
+    if (secret.length < 32) return null;
+    if (cachedAesKey && cachedKeySecret === secret) return cachedAesKey;
+    const digest = await crypto.subtle.digest("SHA-256", enc.encode(`osmium-web-cookie-v1:${secret}`));
+    cachedAesKey = await crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+    cachedKeySecret = secret;
+    return cachedAesKey;
+}
+
+async function sealCookie(env, name, payloadObj) {
+    const key = await getCookieAesKey(env);
+    if (!key) return null;
+    const iv = new Uint8Array(12);
+    crypto.getRandomValues(iv);
+    const plain = enc.encode(JSON.stringify(payloadObj));
+    const cipher = new Uint8Array(
+        await crypto.subtle.encrypt(
+            { name: "AES-GCM", iv, additionalData: enc.encode(name) },
+            key,
+            plain
+        )
+    );
+    const combined = new Uint8Array(12 + cipher.length);
+    combined.set(iv, 0);
+    combined.set(cipher, 12);
+    return toBase64Url(combined);
+}
+
+async function openCookie(env, name, rawValue) {
+    const key = await getCookieAesKey(env);
+    if (!key || !rawValue) return null;
+    const combined = fromBase64Url(rawValue);
+    if (!combined || combined.length <= 28) return null;
+    const iv = combined.subarray(0, 12);
+    const cipher = combined.subarray(12);
+    try {
+        const plain = await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv, additionalData: enc.encode(name) },
+            key,
+            cipher
+        );
+        const obj = JSON.parse(dec.decode(plain));
+        if (!obj || typeof obj !== "object") return null;
+        if (typeof obj.exp === "number" && obj.exp <= Date.now()) return null;
+        return obj;
+    } catch {
+        return null;
+    }
+}
+
+function parseCookies(request) {
+    const raw = request.headers.get("Cookie") || "";
+    const map = Object.create(null);
+    if (!raw) return map;
+    for (const part of raw.split(";")) {
+        const idx = part.indexOf("=");
+        if (idx <= 0) continue;
+        const k = part.slice(0, idx).trim();
+        const v = part.slice(idx + 1).trim();
+        if (k) map[k] = v;
+    }
+    return map;
+}
+
+function formatSetCookie(name, value, maxAgeSec, isSecure) {
+    const parts = [
+        `${name}=${value}`,
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        `Max-Age=${Math.max(0, Math.floor(maxAgeSec))}`
+    ];
+    if (isSecure) parts.push("Secure");
+    return parts.join("; ");
+}
+
+function clearCookie(name, isSecure) {
+    return formatSetCookie(name, "", 0, isSecure);
+}
+
+function jsonResponse(body, status, signalingOrigin, extraCookies = []) {
+    const headers = new Headers({
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        "Pragma": "no-cache",
+        ...baseSecurityHeaders(signalingOrigin)
+    });
+    for (const c of extraCookies) {
+        if (c) headers.append("Set-Cookie", c);
+    }
+    return new Response(JSON.stringify(body), { status, headers });
+}
+
+function isSameOriginPost(request, url) {
+    const origin = (request.headers.get("Origin") || "").trim();
+    const fetchSite = (request.headers.get("Sec-Fetch-Site") || "").trim().toLowerCase();
+    if (origin) {
+        return origin === url.origin;
+    }
+    return fetchSite === "same-origin";
+}
+
+async function readJsonPayload(request, maxBytes = 16384) {
+    const ct = (request.headers.get("Content-Type") || "").toLowerCase();
+    if (!ct.includes("application/json")) return null;
+    const text = await request.text();
+    if (!text || text.length > maxBytes) return null;
+    try {
+        const parsed = JSON.parse(text);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
+function sanitizeAvatarData(raw) {
+    if (typeof raw !== "string") return null;
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.length > 262144) return null;
+    if (/^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/.test(trimmed)) {
+        return trimmed;
+    }
+    return null;
+}
+
+function extractPublicUser(src) {
+    if (!src || typeof src !== "object") return null;
+    return {
+        user_id: String(src.user_id || ""),
+        username: String(src.username || "Osmium"),
+        email: String(src.email || ""),
+        avatar_data: sanitizeAvatarData(src.avatar_data),
+        account_status: String(src.account_status || (src.locked ? "locked" : "active")),
+        locked: Boolean(src.locked),
+        has_email: src.has_email !== false,
+        has_password: src.has_password !== false,
+        profile_complete: src.profile_complete !== false
+    };
+}
+
+function getSignalingOrigin(env) {
+    return String(env.SIGNALING_ORIGIN || "https://osmium.fufu.skin").replace(/\/+$/, "");
+}
+
+function getWsOrigin(signalingOrigin) {
+    try {
+        const u = new URL(signalingOrigin);
+        return (u.protocol === "http:" ? "ws://" : "wss://") + u.host;
+    } catch {
+        return "wss://osmium.fufu.skin";
+    }
+}
+
+async function upstreamFetch(signalingOrigin, path, init = {}) {
+    const headers = new Headers(init.headers || {});
+    headers.set("Accept", "application/json");
+    const resp = await fetch(`${signalingOrigin}${path}`, {
+        method: init.method || "GET",
+        headers,
+        body: init.body,
+        signal: AbortSignal.timeout(15000)
+    });
+    let json = null;
+    try {
+        json = await resp.json();
+    } catch {}
+    return { status: resp.status, ok: resp.ok, json };
+}
+
+async function ensureDeviceId(env, cookies, isSecure) {
+    const existing = await openCookie(env, DEVICE_COOKIE, cookies[DEVICE_COOKIE]);
+    if (existing && typeof existing.deviceId === "string" && /^\d{6,12}$/.test(existing.deviceId)) {
+        return { deviceId: existing.deviceId, setCookie: null };
+    }
+    const deviceId = generateNumericDeviceId();
+    const sealed = await sealCookie(env, DEVICE_COOKIE, {
+        deviceId,
+        exp: Date.now() + DEVICE_MAX_AGE_SEC * 1000
+    });
+    return {
+        deviceId,
+        setCookie: sealed ? formatSetCookie(DEVICE_COOKIE, sealed, DEVICE_MAX_AGE_SEC, isSecure) : null
+    };
+}
+
+async function createSessionFromUpstream(env, sessionData, deviceId, isSecure) {
+    const stoken = typeof sessionData?.stoken === "string" ? sessionData.stoken.trim() : "";
+    const ltoken = typeof sessionData?.ltoken === "string" ? sessionData.ltoken.trim() : "";
+    const user = extractPublicUser(sessionData);
+    if (!stoken || !ltoken || !user || !user.user_id) return null;
+    const expiresInSec = Number(sessionData.expires_in || 900);
+    const csrfToken = randomBase64Url(24);
+    const payload = {
+        stoken,
+        ltoken,
+        ltokenExp: Date.now() + Math.max(120, expiresInSec) * 1000,
+        userId: user.user_id,
+        deviceId,
+        csrfToken,
+        exp: Date.now() + SESSION_MAX_AGE_SEC * 1000
+    };
+    const sealed = await sealCookie(env, SESSION_COOKIE, payload);
+    if (!sealed) return null;
+    return {
+        cookie: formatSetCookie(SESSION_COOKIE, sealed, SESSION_MAX_AGE_SEC, isSecure),
+        user,
+        csrfToken,
+        wsToken: ltoken,
+        wsExpiresIn: expiresInSec,
+        deviceId
+    };
+}
+
+async function resolveActiveSession(env, cookies, signalingOrigin, isSecure, forceRefresh = false) {
+    const sess = await openCookie(env, SESSION_COOKIE, cookies[SESSION_COOKIE]);
+    if (!sess || !sess.stoken || !sess.userId || !sess.csrfToken) {
+        return { ok: false, clearCookie: cookies[SESSION_COOKIE] ? clearCookie(SESSION_COOKIE, isSecure) : null };
+    }
+    const now = Date.now();
+    const deviceId = /^\d{6,12}$/.test(String(sess.deviceId || "")) ? String(sess.deviceId) : generateNumericDeviceId();
+    if (!forceRefresh && sess.ltoken && typeof sess.ltokenExp === "number" && now < sess.ltokenExp - 120000) {
+        return {
+            ok: true,
+            sess: { ...sess, deviceId },
+            ltoken: sess.ltoken,
+            rotatedCookie: null,
+            user: null
+        };
+    }
+    const res = await upstreamFetch(signalingOrigin, "/api/auth/ltoken", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-SToken": sess.stoken
+        },
+        body: "{}"
+    });
+    if (!res.ok || !res.json?.ok || !res.json?.data?.ltoken) {
+        if (res.status === 401 || res.status === 403) {
+            return { ok: false, clearCookie: clearCookie(SESSION_COOKIE, isSecure) };
+        }
+        return { ok: false, upstreamError: true, status: res.status || 502, code: res.json?.code || 1020 };
+    }
+    const d = res.json.data;
+    const expiresInSec = Number(d.expires_in || 900);
+    const updated = {
+        ...sess,
+        deviceId,
+        ltoken: d.ltoken,
+        ltokenExp: now + Math.max(120, expiresInSec) * 1000,
+        exp: now + SESSION_MAX_AGE_SEC * 1000
+    };
+    const sealed = await sealCookie(env, SESSION_COOKIE, updated);
+    return {
+        ok: true,
+        sess: updated,
+        ltoken: d.ltoken,
+        wsExpiresIn: expiresInSec,
+        rotatedCookie: sealed ? formatSetCookie(SESSION_COOKIE, sealed, SESSION_MAX_AGE_SEC, isSecure) : null,
+        user: extractPublicUser(d)
+    };
+}
+
+function appendWebModeToCaptchaUrl(rawUrl) {
+    if (typeof rawUrl !== "string" || !rawUrl) return "";
+    try {
+        const u = new URL(rawUrl);
+        u.searchParams.set("mode", "web");
+        return u.toString();
+    } catch {
+        return rawUrl;
+    }
+}
+
+async function handleWebApi(request, env, url) {
+    const signalingOrigin = getSignalingOrigin(env);
+    const isSecure = url.protocol === "https:";
+    const method = request.method.toUpperCase();
+    const pathname = url.pathname;
+
+    const cookieKey = await getCookieAesKey(env);
+    if (!cookieKey) {
+        return jsonResponse({ ok: false, code: 5002 }, 503, signalingOrigin);
+    }
+
+    if (method === "POST" && !isSameOriginPost(request, url)) {
+        return jsonResponse({ ok: false, code: 2001 }, 403, signalingOrigin);
+    }
+
+    const cookies = parseCookies(request);
+
+    if (pathname === "/web-api/auth/providers" && method === "GET") {
+        try {
+            const res = await upstreamFetch(signalingOrigin, "/api/auth/oauth/providers?platform=web");
+            if (!res.ok || !res.json?.ok) {
+                return jsonResponse({ ok: false, code: res.json?.code || 5001 }, res.status || 502, signalingOrigin);
+            }
+            const data = res.json.data || {};
+            return jsonResponse({
+                ok: true,
+                code: 0,
+                data: {
+                    google: Boolean(data.google),
+                    qq: Boolean(data.qq),
+                    wechat: Boolean(data.wechat),
+                    providers: Array.isArray(data.providers) ? data.providers : []
+                }
+            }, 200, signalingOrigin);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin);
+        }
+    }
+
+    if (pathname === "/web-api/auth/login" && method === "POST") {
+        const body = await readJsonPayload(request, 8192);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const email = typeof body.email === "string" ? body.email.trim() : "";
+        const password = typeof body.password === "string" ? body.password : "";
+        if (!email || !password || email.length > 254 || password.length > 128) {
+            return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        }
+        const dev = await ensureDeviceId(env, cookies, isSecure);
+        const setCookies = dev.setCookie ? [dev.setCookie] : [];
+        try {
+            const res = await upstreamFetch(signalingOrigin, "/api/auth/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    email,
+                    password,
+                    device_id: dev.deviceId,
+                    device_name: "Osmium Web",
+                    os_version: "Web"
+                })
+            });
+            if (res.status === 202 && res.json?.data?.challenge_id && res.json?.data?.challenge_secret) {
+                const ch = res.json.data;
+                const chSealed = await sealCookie(env, CHALLENGE_COOKIE, {
+                    challengeId: String(ch.challenge_id),
+                    challengeSecret: String(ch.challenge_secret),
+                    deviceId: dev.deviceId,
+                    exp: Date.now() + PENDING_MAX_AGE_SEC * 1000
+                });
+                if (!chSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin);
+                setCookies.push(formatSetCookie(CHALLENGE_COOKIE, chSealed, PENDING_MAX_AGE_SEC, isSecure));
+                return jsonResponse({
+                    ok: true,
+                    code: res.json.code || 100,
+                    data: {
+                        challenge_id: String(ch.challenge_id),
+                        captcha_url: appendWebModeToCaptchaUrl(ch.captcha_url),
+                        expires_in: Number(ch.expires_in || 300)
+                    }
+                }, 202, signalingOrigin, setCookies);
+            }
+            if (res.ok && res.json?.ok && res.json?.data?.stoken) {
+                const built = await createSessionFromUpstream(env, res.json.data, dev.deviceId, isSecure);
+                if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin);
+                setCookies.push(built.cookie);
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        user: built.user,
+                        csrfToken: built.csrfToken,
+                        wsToken: built.wsToken,
+                        wsExpiresIn: built.wsExpiresIn,
+                        deviceId: built.deviceId,
+                        signalingUrl: getWsOrigin(signalingOrigin)
+                    }
+                }, 200, signalingOrigin, setCookies);
+            }
+            return jsonResponse({
+                ok: false,
+                code: res.json?.code || 2002,
+                data: res.json?.data
+            }, res.status || 400, signalingOrigin, setCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin, setCookies);
+        }
+    }
+
+    if (pathname === "/web-api/auth/challenge/status" && method === "GET") {
+        const ch = await openCookie(env, CHALLENGE_COOKIE, cookies[CHALLENGE_COOKIE]);
+        if (!ch || !ch.challengeId || !ch.challengeSecret) {
+            return jsonResponse({ ok: false, code: 3001 }, 410, signalingOrigin, [clearCookie(CHALLENGE_COOKIE, isSecure)]);
+        }
+        try {
+            const res = await upstreamFetch(
+                signalingOrigin,
+                `/api/auth/challenge/status?challenge_id=${encodeURIComponent(ch.challengeId)}`,
+                {
+                    method: "GET",
+                    headers: { "X-Challenge-Secret": ch.challengeSecret }
+                }
+            );
+            if (res.json?.code === 101 || res.json?.data?.state === "pending") {
+                return jsonResponse({ ok: true, code: 101, data: { state: "pending" } }, 200, signalingOrigin);
+            }
+            const clearCh = clearCookie(CHALLENGE_COOKIE, isSecure);
+            if (res.ok && res.json?.ok && res.json?.data?.stoken) {
+                const built = await createSessionFromUpstream(env, res.json.data, ch.deviceId, isSecure);
+                if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, [clearCh]);
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        state: "completed",
+                        user: built.user,
+                        csrfToken: built.csrfToken,
+                        wsToken: built.wsToken,
+                        wsExpiresIn: built.wsExpiresIn,
+                        deviceId: built.deviceId,
+                        signalingUrl: getWsOrigin(signalingOrigin)
+                    }
+                }, 200, signalingOrigin, [clearCh, built.cookie]);
+            }
+            return jsonResponse({
+                ok: false,
+                code: res.json?.code || 2002,
+                data: res.json?.data
+            }, res.status || 400, signalingOrigin, [clearCh]);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin);
+        }
+    }
+
+    if (pathname === "/web-api/auth/oauth/start" && method === "POST") {
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const provider = typeof body.provider === "string" ? body.provider.trim().toLowerCase() : "";
+        if (provider !== "google" && provider !== "qq" && provider !== "wechat") {
+            return jsonResponse({ ok: false, code: 1014 }, 400, signalingOrigin);
+        }
+        const dev = await ensureDeviceId(env, cookies, isSecure);
+        const setCookies = dev.setCookie ? [dev.setCookie] : [];
+        try {
+            const res = await upstreamFetch(signalingOrigin, "/api/auth/oauth/start", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    provider,
+                    platform: "web",
+                    device_id: dev.deviceId,
+                    device_name: "Osmium Web",
+                    os_version: "Web"
+                })
+            });
+            if (!res.ok || !res.json?.ok || !res.json?.data?.state || !res.json?.data?.poll_secret) {
+                return jsonResponse({ ok: false, code: res.json?.code || 5001 }, res.status || 502, signalingOrigin, setCookies);
+            }
+            const d = res.json.data;
+            const oaSealed = await sealCookie(env, OAUTH_COOKIE, {
+                state: String(d.state),
+                pollSecret: String(d.poll_secret),
+                provider,
+                deviceId: dev.deviceId,
+                exp: Date.now() + PENDING_MAX_AGE_SEC * 1000
+            });
+            if (!oaSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+            setCookies.push(formatSetCookie(OAUTH_COOKIE, oaSealed, PENDING_MAX_AGE_SEC, isSecure));
+            return jsonResponse({
+                ok: true,
+                code: 0,
+                data: {
+                    provider,
+                    authorize_url: String(d.authorize_url || ""),
+                    expires_in: Number(d.expires_in || 300),
+                    poll_interval_ms: Number(d.poll_interval_ms || 1200)
+                }
+            }, 200, signalingOrigin, setCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin, setCookies);
+        }
+    }
+
+    if (pathname === "/web-api/auth/oauth/status" && method === "GET") {
+        const oa = await openCookie(env, OAUTH_COOKIE, cookies[OAUTH_COOKIE]);
+        if (!oa || !oa.state || !oa.pollSecret) {
+            return jsonResponse({ ok: false, code: 3017 }, 410, signalingOrigin, [clearCookie(OAUTH_COOKIE, isSecure)]);
+        }
+        try {
+            const res = await upstreamFetch(
+                signalingOrigin,
+                `/api/auth/oauth/status?state=${encodeURIComponent(oa.state)}`,
+                {
+                    method: "GET",
+                    headers: { "X-OAuth-Secret": oa.pollSecret }
+                }
+            );
+            if (res.ok && res.json?.ok && res.json?.data?.state === "pending") {
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: { state: "pending", expires_in: Number(res.json.data.expires_in || 60) }
+                }, 200, signalingOrigin);
+            }
+            const clearOa = clearCookie(OAUTH_COOKIE, isSecure);
+            if (res.ok && res.json?.ok && res.json?.data?.state === "completed" && res.json?.data?.session?.stoken) {
+                const built = await createSessionFromUpstream(env, res.json.data.session, oa.deviceId, isSecure);
+                if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, [clearOa]);
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        state: "completed",
+                        user: built.user,
+                        csrfToken: built.csrfToken,
+                        wsToken: built.wsToken,
+                        wsExpiresIn: built.wsExpiresIn,
+                        deviceId: built.deviceId,
+                        signalingUrl: getWsOrigin(signalingOrigin)
+                    }
+                }, 200, signalingOrigin, [clearOa, built.cookie]);
+            }
+            return jsonResponse({
+                ok: false,
+                code: res.json?.code || 3018
+            }, res.status || 400, signalingOrigin, [clearOa]);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin);
+        }
+    }
+
+    if (pathname === "/web-api/auth/oauth/cancel" && method === "POST") {
+        const oa = await openCookie(env, OAUTH_COOKIE, cookies[OAUTH_COOKIE]);
+        const clearOa = clearCookie(OAUTH_COOKIE, isSecure);
+        if (oa && oa.state && oa.pollSecret) {
+            try {
+                await upstreamFetch(signalingOrigin, "/api/auth/oauth/cancel", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-OAuth-Secret": oa.pollSecret
+                    },
+                    body: JSON.stringify({ state: oa.state })
+                });
+            } catch {}
+        }
+        return jsonResponse({ ok: true, code: 0 }, 200, signalingOrigin, [clearOa]);
+    }
+
+    if (pathname === "/web-api/session" && method === "GET") {
+        const force = url.searchParams.get("refresh") === "1";
+        const active = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, force);
+        if (!active.ok) {
+            if (active.upstreamError) {
+                return jsonResponse({ ok: false, code: active.code || 5001 }, active.status || 502, signalingOrigin);
+            }
+            return jsonResponse({ ok: false, code: 2001 }, 401, signalingOrigin, active.clearCookie ? [active.clearCookie] : []);
+        }
+        const outCookies = active.rotatedCookie ? [active.rotatedCookie] : [];
+        let user = active.user;
+        let wsToken = active.ltoken;
+        let wsExpiresIn = active.wsExpiresIn || Math.max(60, Math.floor((active.sess.ltokenExp - Date.now()) / 1000));
+        if (!user) {
+            const stRes = await upstreamFetch(signalingOrigin, "/api/account/status", {
+                method: "GET",
+                headers: { "X-LToken": wsToken }
+            });
+            if (stRes.ok && stRes.json?.ok && stRes.json?.data) {
+                user = extractPublicUser(stRes.json.data);
+            } else {
+                const refreshed = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, true);
+                if (!refreshed.ok) {
+                    return jsonResponse({ ok: false, code: 2001 }, 401, signalingOrigin, refreshed.clearCookie ? [refreshed.clearCookie] : []);
+                }
+                user = refreshed.user;
+                wsToken = refreshed.ltoken;
+                wsExpiresIn = refreshed.wsExpiresIn || 900;
+                if (refreshed.rotatedCookie) outCookies.push(refreshed.rotatedCookie);
+            }
+        }
+        return jsonResponse({
+            ok: true,
+            code: 0,
+            data: {
+                user,
+                csrfToken: active.sess.csrfToken,
+                wsToken,
+                wsExpiresIn,
+                deviceId: active.sess.deviceId,
+                signalingUrl: getWsOrigin(signalingOrigin)
+            }
+        }, 200, signalingOrigin, outCookies);
+    }
+
+    if (pathname === "/web-api/auth/logout" && method === "POST") {
+        const active = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, false);
+        const clearAll = [
+            clearCookie(SESSION_COOKIE, isSecure),
+            clearCookie(CHALLENGE_COOKIE, isSecure),
+            clearCookie(OAUTH_COOKIE, isSecure)
+        ];
+        if (!active.ok) {
+            return jsonResponse({ ok: true, code: 0 }, 200, signalingOrigin, clearAll);
+        }
+        const csrfHeader = (request.headers.get("X-CSRF-Token") || "").trim();
+        if (!timingSafeEqual(csrfHeader, active.sess.csrfToken)) {
+            return jsonResponse({ ok: false, code: 2001 }, 403, signalingOrigin);
+        }
+        try {
+            await upstreamFetch(signalingOrigin, "/api/auth/logout", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-LToken": active.ltoken
+                },
+                body: JSON.stringify({
+                    revoke_stoken: false,
+                    device_id: active.sess.deviceId
+                })
+            });
+        } catch {}
+        return jsonResponse({ ok: true, code: 0 }, 200, signalingOrigin, clearAll);
+    }
+
+    if (pathname === "/web-api/devices" && method === "GET") {
+        const active = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, false);
+        if (!active.ok) {
+            return jsonResponse({ ok: false, code: 2001 }, 401, signalingOrigin, active.clearCookie ? [active.clearCookie] : []);
+        }
+        const outCookies = active.rotatedCookie ? [active.rotatedCookie] : [];
+        let res = await upstreamFetch(signalingOrigin, "/api/account/devices", {
+            method: "GET",
+            headers: { "X-LToken": active.ltoken }
+        });
+        if (res.status === 401 || res.status === 403) {
+            const refreshed = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, true);
+            if (!refreshed.ok) {
+                return jsonResponse({ ok: false, code: 2001 }, 401, signalingOrigin, refreshed.clearCookie ? [refreshed.clearCookie] : []);
+            }
+            if (refreshed.rotatedCookie) outCookies.push(refreshed.rotatedCookie);
+            res = await upstreamFetch(signalingOrigin, "/api/account/devices", {
+                method: "GET",
+                headers: { "X-LToken": refreshed.ltoken }
+            });
+        }
+        if (!res.ok || !res.json?.ok) {
+            return jsonResponse({ ok: false, code: res.json?.code || 5001 }, res.status || 502, signalingOrigin, outCookies);
+        }
+        return jsonResponse({
+            ok: true,
+            code: 0,
+            data: res.json.data
+        }, 200, signalingOrigin, outCookies);
+    }
+
+    if (pathname === "/web-api/devices/power" && method === "POST") {
+        const active = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, false);
+        if (!active.ok) {
+            return jsonResponse({ ok: false, code: 2001 }, 401, signalingOrigin, active.clearCookie ? [active.clearCookie] : []);
+        }
+        const csrfHeader = (request.headers.get("X-CSRF-Token") || "").trim();
+        if (!timingSafeEqual(csrfHeader, active.sess.csrfToken)) {
+            return jsonResponse({ ok: false, code: 2001 }, 403, signalingOrigin);
+        }
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const targetId = String(body.device_id || "").replace(/\D/g, "");
+        const action = typeof body.action === "string" ? body.action.trim().toLowerCase() : "";
+        if (!/^\d{6,12}$/.test(targetId) || (action !== "wake" && action !== "shutdown" && action !== "restart")) {
+            return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        }
+        const outCookies = active.rotatedCookie ? [active.rotatedCookie] : [];
+        let res = await upstreamFetch(signalingOrigin, "/api/account/devices/power", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-LToken": active.ltoken
+            },
+            body: JSON.stringify({ device_id: targetId, action })
+        });
+        if (res.status === 401 || res.status === 403) {
+            if (res.json?.code === 2001) {
+                const refreshed = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, true);
+                if (refreshed.ok) {
+                    if (refreshed.rotatedCookie) outCookies.push(refreshed.rotatedCookie);
+                    res = await upstreamFetch(signalingOrigin, "/api/account/devices/power", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "X-LToken": refreshed.ltoken
+                        },
+                        body: JSON.stringify({ device_id: targetId, action })
+                    });
+                }
+            }
+        }
+        return jsonResponse(
+            res.json || { ok: false, code: 5001 },
+            res.status || 502,
+            signalingOrigin,
+            outCookies
+        );
+    }
+
+    return jsonResponse({ ok: false, code: 1013 }, 404, signalingOrigin);
+}
+
+export default {
+    async fetch(request, env) {
+        const url = new URL(request.url);
+        const signalingOrigin = getSignalingOrigin(env);
+
+        if (url.pathname.startsWith("/web-api/")) {
+            return handleWebApi(request, env, url);
+        }
+
+        if (request.method !== "GET" && request.method !== "HEAD") {
+            return new Response(null, {
+                status: 405,
+                headers: baseSecurityHeaders(signalingOrigin)
+            });
+        }
+
+        const assetResp = await env.ASSETS.fetch(request);
+        const headers = new Headers(assetResp.headers);
+        const sec = baseSecurityHeaders(signalingOrigin);
+        for (const [k, v] of Object.entries(sec)) {
+            headers.set(k, v);
+        }
+        if (/^\/app\.[a-f0-9]{10}\.(?:js|css)$/.test(url.pathname)) {
+            headers.set("Cache-Control", "public, max-age=31536000, immutable");
+        } else if (
+            url.pathname === "/" ||
+            url.pathname.endsWith(".html") ||
+            url.pathname.endsWith(".js") ||
+            url.pathname.endsWith(".css")
+        ) {
+            headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
+            headers.set("Pragma", "no-cache");
+        } else {
+            headers.set("Cache-Control", "public, max-age=86400");
+        }
+        return new Response(assetResp.body, {
+            status: assetResp.status,
+            statusText: assetResp.statusText,
+            headers
+        });
+    }
+};

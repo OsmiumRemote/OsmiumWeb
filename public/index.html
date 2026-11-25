@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta id="meta-theme-color" name="theme-color" content="#ffffff">
+<link rel="icon" type="image/png" href="/logo.png">
+<title>Osmium Web</title>
+<link rel="stylesheet" href="/styles.css?v=20261125b">
+</head>
+<body>
+<div id="boot-screen" class="boot-screen">
+  <div class="boot-inner">
+    <img src="/logo.png" alt="Osmium Web" class="boot-logo">
+    <div class="win-spinner" aria-hidden="true"></div>
+  </div>
+</div>
+
+<section id="auth-view" class="auth-view hidden" data-i18n-aria="auth_title" aria-label="登录">
+  <div class="ms-auth-card">
+    <div class="ms-brand-row">
+      <img src="/logo.png" alt="Osmium Web" class="ms-brand-logo">
+      <span class="ms-brand-name">Osmium Web</span>
+    </div>
+
+    <h1 class="ms-title" data-i18n="auth_title">登录</h1>
+    <p class="ms-subtitle" data-i18n="auth_subtitle">使用您的Osmium账号。</p>
+
+    <div id="auth-offline-banner" class="win-infobar error hidden">
+      <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="8"/><line x1="10" y1="6" x2="10" y2="10.5"/><circle cx="10" cy="13.5" r="0.8" fill="currentColor" stroke="none"/></svg>
+      <span class="infobar-text" data-i18n="auth_offline">暂时无法连接登录服务，当前不可登录</span>
+      <button id="btn-retry-providers" type="button" class="win-btn compact" data-i18n="btn_retry">重试</button>
+    </div>
+
+    <form id="login-form" class="ms-form" autocomplete="on" novalidate>
+      <div class="ms-input-group">
+        <input id="login-email" class="ms-input" type="email" autocomplete="email" data-i18n-placeholder="ph_email" data-i18n-aria="ph_email" placeholder="电子邮箱地址" aria-label="电子邮箱地址" required>
+      </div>
+
+      <div class="ms-input-group">
+        <div class="ms-password-wrap">
+          <input id="login-password" class="ms-input" type="password" autocomplete="current-password" data-i18n-placeholder="ph_password" data-i18n-aria="ph_password" placeholder="密码" aria-label="密码" required>
+          <button id="btn-toggle-login-pw" type="button" class="input-eye-btn" data-i18n-aria="aria_toggle_pw" aria-label="显示或隐藏密码">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div id="auth-error" class="ms-error hidden" role="alert"></div>
+
+      <button id="btn-login-submit" type="submit" class="ms-primary-btn" data-i18n="btn_login">登录</button>
+    </form>
+
+    <div id="oauth-section" class="ms-oauth-section hidden">
+      <div class="ms-divider"><span data-i18n="auth_other">其他登录方式</span></div>
+      <div id="oauth-buttons" class="ms-oauth-list"></div>
+    </div>
+  </div>
+  <div class="auth-lang-bar">
+    <button id="btn-auth-lang" type="button" class="auth-lang-btn">English</button>
+  </div>
+</section>
+
+<div id="app-shell" class="win-shell hidden">
+  <header class="win-titlebar">
+    <div class="win-titlebar-brand">
+      <img src="/logo.png" alt="Osmium Web" class="win-titlebar-logo">
+      <span class="win-titlebar-text">Osmium Web</span>
+    </div>
+  </header>
+
+  <div class="win-body">
+    <aside class="win-nav-pane" data-i18n-aria="nav_aria" aria-label="主导航">
+      <div id="nav-indicator" class="win-nav-indicator" aria-hidden="true"></div>
+      <div class="win-nav-scroll">
+        <div class="win-nav-header" data-i18n="nav_group_devices">设备</div>
+        <button type="button" class="win-nav-item active" data-tab="devices" data-index="0">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          <span class="nav-label" data-i18n="nav_devices">我的设备</span>
+        </button>
+
+        <div class="win-nav-header" data-i18n="nav_group_remote">远程协助</div>
+        <button type="button" class="win-nav-item" data-tab="connect" data-index="1">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14L21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+          <span class="nav-label" data-i18n="nav_connect">远程控制</span>
+        </button>
+      </div>
+
+      <div class="win-nav-footer">
+        <button type="button" class="win-nav-item" data-tab="account" data-index="2">
+          <span id="nav-avatar-slot" class="nav-avatar"></span>
+          <span id="nav-account-label" class="nav-label" data-i18n="nav_account">账号</span>
+        </button>
+        <button type="button" class="win-nav-item" data-tab="settings" data-index="3">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span class="nav-label" data-i18n="nav_settings">设置</span>
+        </button>
+      </div>
+    </aside>
+
+    <main class="win-content-frame">
+      <div id="win-page-host" class="win-page-host">
+        <div id="browser-notice" class="win-infobar info hidden">
+          <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="8"/><line x1="10" y1="9" x2="10" y2="14"/><circle cx="10" cy="6.2" r="0.8" fill="currentColor" stroke="none"/></svg>
+          <span id="browser-notice-text" class="infobar-text"></span>
+        </div>
+
+        <div id="account-locked-banner" class="win-infobar error hidden">
+          <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="9" width="12" height="8" rx="1.5"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>
+          <span class="infobar-text" data-i18n="banner_locked">当前账号已锁定，暂无法发起远程控制或电源操作</span>
+        </div>
+
+        <section id="tab-devices" class="win-page">
+          <div class="win-page-header">
+            <h2 class="win-page-title" data-i18n="nav_devices">我的设备</h2>
+            <div class="devices-toolbar">
+              <div class="win-search-wrap">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><line x1="20" y1="20" x2="16.65" y2="16.65"/></svg>
+                <input id="device-search" class="win-input compact search" type="text" data-i18n-placeholder="ph_search_devices" placeholder="搜索设备名或ID" autocomplete="off">
+              </div>
+              <select id="device-filter" class="win-select compact" data-i18n-aria="aria_filter_devices" aria-label="筛选设备">
+                <option value="all" data-i18n="filter_all">全部设备</option>
+                <option value="online" data-i18n="filter_online">仅在线</option>
+              </select>
+              <button id="btn-toggle-layout" type="button" class="win-icon-btn" data-i18n-title="title_toggle_layout" title="切换视图">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+              </button>
+              <button id="btn-refresh-devices" type="button" class="win-btn compact">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                <span data-i18n="btn_refresh">刷新</span>
+              </button>
+            </div>
+          </div>
+          <div id="devices-container" class="devices-container grid"></div>
+        </section>
+
+        <section id="tab-connect" class="win-page hidden">
+          <h2 class="win-page-title" data-i18n="nav_connect">远程控制</h2>
+
+          <div class="win-card">
+            <div class="win-card-heading" data-i18n="partner_heading">控制伙伴设备</div>
+            <form id="remote-connect-form" class="partner-form" novalidate>
+              <div class="partner-grid">
+                <label class="win-field">
+                  <span class="win-field-label" data-i18n="label_partner_id">伙伴设备ID</span>
+                  <input id="target-device-id" class="win-input" type="text" inputmode="numeric" maxlength="15" data-i18n-placeholder="ph_partner_id" placeholder="请输入9位设备ID" autocomplete="off">
+                </label>
+
+                <label class="win-field">
+                  <span class="win-field-label" data-i18n="label_access_code">访问密码</span>
+                  <div class="ms-password-wrap">
+                    <input id="target-access-code" class="win-input" type="password" maxlength="32" data-i18n-placeholder="ph_access_code" placeholder="请输入访问密码" autocomplete="off">
+                    <button id="btn-toggle-code" type="button" class="input-eye-btn" data-i18n-aria="aria_toggle_code" aria-label="显示或隐藏访问密码">
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+                    </button>
+                  </div>
+                </label>
+
+                <button id="btn-start-connect" type="submit" class="win-btn accent connect-submit" data-i18n="btn_connect">连接</button>
+              </div>
+
+              <div class="partner-options-row">
+                <span class="win-option-label" data-i18n="label_view_only_opt">仅查看模式（不发送键鼠输入）</span>
+                <label class="win-toggle">
+                  <input id="connect-view-only" type="checkbox">
+                  <span class="win-toggle-track"><span class="win-toggle-knob"></span></span>
+                </label>
+              </div>
+
+              <div id="cooldown-hint" class="cooldown-hint hidden"></div>
+            </form>
+
+            <div class="win-divider"></div>
+
+            <div class="recent-header">
+              <span class="recent-title" data-i18n="recent_title">最近连接</span>
+              <button id="btn-clear-recent" type="button" class="win-subtle-btn" data-i18n="btn_clear_recent">清空记录</button>
+            </div>
+            <div id="recent-list" class="recent-list"></div>
+          </div>
+        </section>
+
+        <section id="tab-account" class="win-page hidden">
+          <h2 class="win-page-title" data-i18n="nav_account">账号</h2>
+
+          <div class="win-grouped-card account-card">
+            <div class="account-hero-row">
+              <div id="profile-avatar-box" class="profile-avatar"></div>
+              <div class="profile-info">
+                <div class="profile-name-line">
+                  <span id="profile-username" class="profile-name">Osmium</span>
+                  <span id="profile-status-badge" class="win-badge ok" data-i18n="account_status_active">正常</span>
+                </div>
+                <div id="profile-email" class="profile-email"></div>
+              </div>
+              <button id="btn-logout" type="button" class="win-btn danger-text" data-i18n="btn_logout">退出登录</button>
+            </div>
+            <div class="win-divider"></div>
+            <div class="win-setting-row">
+              <div class="setting-row-icon">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><circle cx="12" cy="8" r="0.8" fill="currentColor" stroke="none"/></svg>
+              </div>
+              <div class="setting-row-text">
+                <div class="setting-row-title" data-i18n="account_readonly_title">账号信息仅支持查看</div>
+                <div class="setting-row-desc" data-i18n="account_readonly_desc">如需修改头像、用户名、密码或管理安全设置，请前往电脑端或手机端Osmium操作</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-settings" class="win-page hidden">
+          <h2 class="win-page-title" data-i18n="nav_settings">设置</h2>
+
+          <div class="win-subtabs" role="tablist">
+            <button type="button" class="win-subtab active" data-subtab="video" data-subindex="0" data-i18n="subtab_video">画面</button>
+            <button type="button" class="win-subtab" data-subtab="input" data-subindex="1" data-i18n="subtab_input">操控</button>
+            <button type="button" class="win-subtab" data-subtab="general" data-subindex="2" data-i18n="subtab_general">通用</button>
+            <div id="subtab-indicator" class="win-subtab-indicator" aria-hidden="true"></div>
+          </div>
+
+          <div class="win-subtab-viewport">
+            <div id="subpanel-video" class="win-subpanel">
+              <div class="win-grouped-card">
+                <div class="win-setting-row">
+                  <div class="setting-row-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                  </div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_res_title">画面分辨率</div>
+                    <div class="setting-row-desc" data-i18n="set_res_desc">选择远控画面的目标清晰度</div>
+                  </div>
+                  <select id="set-resolution" class="win-select">
+                    <option value="native" data-i18n="opt_res_native">跟随被控端</option>
+                    <option value="1080p">1080p</option>
+                    <option value="720p">720p</option>
+                  </select>
+                </div>
+                <div class="win-divider"></div>
+                <div class="win-setting-row">
+                  <div class="setting-row-spacer"></div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_fps_title">目标帧率</div>
+                    <div class="setting-row-desc" data-i18n="set_fps_desc">更高帧率带来更顺滑的画面体验</div>
+                  </div>
+                  <select id="set-fps" class="win-select">
+                    <option value="30" data-i18n="opt_fps_30">30帧</option>
+                    <option value="60" data-i18n="opt_fps_60">60帧</option>
+                    <option value="120" data-chrome-only="1" data-i18n="opt_fps_120">120帧</option>
+                  </select>
+                </div>
+                <div class="win-divider"></div>
+                <div class="win-setting-row">
+                  <div class="setting-row-spacer"></div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_br_title">画质码率</div>
+                    <div class="setting-row-desc" data-i18n="set_br_desc">网络较差时可适当调低以减少卡顿</div>
+                  </div>
+                  <select id="set-bitrate" class="win-select">
+                    <option value="4000">4M</option>
+                    <option value="8000">8M</option>
+                    <option value="16000">16M</option>
+                    <option value="25000">25M</option>
+                  </select>
+                </div>
+                <div id="row-codec-divider" class="win-divider"></div>
+                <div id="row-codec" class="win-setting-row">
+                  <div class="setting-row-spacer"></div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_codec_title">视频格式</div>
+                    <div class="setting-row-desc" data-i18n="set_codec_desc">仅显示当前浏览器支持的画面格式</div>
+                  </div>
+                  <select id="set-codec" class="win-select"></select>
+                </div>
+              </div>
+            </div>
+
+            <div id="subpanel-input" class="win-subpanel hidden">
+              <div class="win-grouped-card">
+                <div id="row-audio" class="win-setting-row">
+                  <div class="setting-row-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+                  </div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_audio_title">同步远程声音</div>
+                    <div class="setting-row-desc" data-i18n="set_audio_desc">连接后在浏览器中播放远程电脑的声音</div>
+                  </div>
+                  <label class="win-toggle">
+                    <input id="set-audio" type="checkbox" checked>
+                    <span class="win-toggle-track"><span class="win-toggle-knob"></span></span>
+                  </label>
+                </div>
+                <div id="row-pointer-lock-divider" class="win-divider"></div>
+                <div id="row-pointer-lock" class="win-setting-row">
+                  <div class="setting-row-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a7 7 0 0 0-7 7v6a7 7 0 0 0 14 0V9a7 7 0 0 0-7-7z"/><line x1="12" y1="6" x2="12" y2="10"/></svg>
+                  </div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_mouse_title">默认启用锁定鼠标</div>
+                    <div class="setting-row-desc" data-i18n="set_mouse_desc">适用于游戏或3D场景中的相对视角移动</div>
+                  </div>
+                  <label class="win-toggle">
+                    <input id="set-relative-mouse" type="checkbox">
+                    <span class="win-toggle-track"><span class="win-toggle-knob"></span></span>
+                  </label>
+                </div>
+                <div id="row-keyboard-lock-divider" class="win-divider"></div>
+                <div id="row-keyboard-lock" class="win-setting-row">
+                  <div class="setting-row-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/></svg>
+                  </div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_kblock_title">全屏时捕获系统快捷键</div>
+                    <div class="setting-row-desc" data-i18n="set_kblock_desc">全屏状态下将Alt+Tab、Win等组合键直接发送至远程电脑</div>
+                  </div>
+                  <label class="win-toggle">
+                    <input id="set-keyboard-lock" type="checkbox" checked>
+                    <span class="win-toggle-track"><span class="win-toggle-knob"></span></span>
+                  </label>
+                </div>
+                <div id="row-gamepad-divider" class="win-divider"></div>
+                <div id="row-gamepad" class="win-setting-row">
+                  <div class="setting-row-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="6" width="20" height="12" rx="4"/><path d="M6 12h4M8 10v4M15 11h.01M18 13h.01"/></svg>
+                  </div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_gamepad_title">手柄映射</div>
+                    <div class="setting-row-desc" data-i18n="set_gamepad_desc">将本地连接的游戏手柄输入同步到远程电脑</div>
+                  </div>
+                  <label class="win-toggle">
+                    <input id="set-gamepad" type="checkbox" checked>
+                    <span class="win-toggle-track"><span class="win-toggle-knob"></span></span>
+                  </label>
+                </div>
+                <div class="win-divider"></div>
+                <div class="win-setting-row">
+                  <div class="setting-row-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>
+                  </div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_clipboard_title">共享剪贴板文本</div>
+                    <div class="setting-row-desc" data-i18n="set_clipboard_desc">在远程会话中双向同步纯文本内容</div>
+                  </div>
+                  <label class="win-toggle">
+                    <input id="set-clipboard" type="checkbox" checked>
+                    <span class="win-toggle-track"><span class="win-toggle-knob"></span></span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div id="subpanel-general" class="win-subpanel hidden">
+              <div class="win-grouped-card">
+                <div class="win-setting-row">
+                  <div class="setting-row-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+                  </div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_theme_title">应用主题</div>
+                    <div class="setting-row-desc" data-i18n="set_theme_desc">默认使用浅色外观，可按需切换为深色</div>
+                  </div>
+                  <select id="set-theme" class="win-select">
+                    <option value="light" data-i18n="opt_theme_light">浅色</option>
+                    <option value="dark" data-i18n="opt_theme_dark">深色</option>
+                  </select>
+                </div>
+                <div class="win-divider"></div>
+                <div class="win-setting-row">
+                  <div class="setting-row-icon">
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><line x1="3" y1="12" x2="21" y2="12"/><path d="M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+                  </div>
+                  <div class="setting-row-text">
+                    <div class="setting-row-title" data-i18n="set_lang_title">界面语言</div>
+                    <div class="setting-row-desc" data-i18n="set_lang_desc">选择Osmium Web的显示语言</div>
+                  </div>
+                  <select id="set-language" class="win-select">
+                    <option value="auto" data-i18n="opt_lang_auto">跟随浏览器</option>
+                    <option value="zh-CN" data-i18n="opt_lang_zh">简体中文</option>
+                    <option value="en-US" data-i18n="opt_lang_en">English</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+</div>
+
+<section id="session-view" class="session-view hidden" data-i18n-aria="session_aria" aria-label="远程桌面会话">
+  <div id="session-stage" class="session-stage">
+    <canvas id="remote-canvas" class="remote-canvas"></canvas>
+    <div id="session-loading" class="session-loading">
+      <div class="win-spinner large"></div>
+      <div id="session-stage-text" class="session-stage-text" data-i18n="session_connecting">正在连接...</div>
+      <button id="btn-cancel-connecting" type="button" class="win-btn dark-surface" data-i18n="btn_cancel_connect">取消连接</button>
+    </div>
+  </div>
+
+  <div id="session-toolbar-wrap" class="session-toolbar-wrap">
+    <button id="btn-toolbar-toggle" type="button" class="toolbar-handle" data-i18n-aria="aria_toggle_toolbar" aria-label="展开或收起工具栏">
+      <span class="handle-bar"></span>
+    </button>
+    <div id="session-toolbar" class="session-toolbar">
+      <div class="toolbar-info">
+        <span id="tb-host-name" class="tb-host" data-i18n="session_default_host">远程桌面</span>
+        <span id="tb-viewonly-tag" class="tb-badge hidden" data-i18n="tag_view_only">仅查看</span>
+        <span id="tb-stats" class="tb-stats" data-i18n="stats_preparing">准备中</span>
+      </div>
+      <div class="toolbar-actions">
+        <select id="tb-display-select" class="tb-select hidden" data-i18n-aria="aria_switch_display" aria-label="切换显示器"></select>
+        <button id="tb-btn-mouse" type="button" class="tb-btn" data-i18n-title="title_lock_mouse" title="切换锁定鼠标">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a7 7 0 0 0-7 7v6a7 7 0 0 0 14 0V9a7 7 0 0 0-7-7z"/><line x1="12" y1="6" x2="12" y2="10"/></svg>
+          <span data-i18n="tb_lock_mouse">锁定鼠标</span>
+        </button>
+        <button id="tb-btn-kblock" type="button" class="tb-btn hidden" data-i18n-title="title_capture_keys" title="捕获系统快捷键">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M7 16h10"/></svg>
+          <span data-i18n="tb_capture_keys">捕获快捷键</span>
+        </button>
+        <button id="tb-btn-audio" type="button" class="tb-btn" data-i18n-title="title_toggle_audio" title="静音或恢复声音">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+          <span data-i18n="tb_audio">声音</span>
+        </button>
+        <button id="tb-btn-clipboard" type="button" class="tb-btn" data-i18n-title="title_clipboard" title="剪贴板文本">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/></svg>
+          <span data-i18n="tb_clipboard">剪贴板</span>
+        </button>
+        <button id="tb-btn-actions" type="button" class="tb-btn" data-i18n-title="title_more_actions" title="更多操作">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
+          <span data-i18n="tb_more">更多</span>
+        </button>
+        <button id="tb-btn-fullscreen" type="button" class="tb-btn" data-i18n-title="title_fullscreen" title="全屏">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+        </button>
+        <button id="tb-btn-disconnect" type="button" class="tb-btn danger" data-i18n-title="title_disconnect" title="断开连接">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <span data-i18n="tb_disconnect">断开</span>
+        </button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div id="flyout-menu" class="win-flyout hidden" role="menu"></div>
+<div id="win-combo-popup" class="win-combo-popup hidden" role="listbox"></div>
+
+<div id="modal-backdrop" class="win-dialog-backdrop hidden" role="dialog" aria-modal="true">
+  <div id="modal-card" class="win-dialog">
+    <div class="win-dialog-content">
+      <h3 id="modal-title" class="win-dialog-title"></h3>
+      <div id="modal-body" class="win-dialog-body"></div>
+    </div>
+    <div id="modal-actions" class="win-dialog-footer"></div>
+  </div>
+</div>
+
+<div id="toast" class="win-toast hidden" role="status" aria-live="polite"></div>
+
+<script type="module" src="/app.js?v=20261125b"></script>
+</body>
+</html>
