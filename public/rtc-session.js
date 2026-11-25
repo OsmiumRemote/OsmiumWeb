@@ -45,6 +45,7 @@ export async function detectBrowserCapabilities() {
     const isEdge = /Edg\//i.test(ua);
     const isOpera = /OPR\//i.test(ua);
     const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+    const hasTouch = Boolean(isMobile || (navigator.maxTouchPoints || 0) > 0 || "ontouchstart" in window);
     const isChromium = /Chrome\/|Chromium\//i.test(ua) && !isFirefox && !isSafari;
     const isChromeDesktop = isChromium && !isMobile;
 
@@ -101,6 +102,7 @@ export async function detectBrowserCapabilities() {
         isFirefox,
         isSafari,
         isMobile,
+        hasTouch,
         canConnect: hasRtc && supportedCodecs.length > 0,
         supportedCodecs,
         canAudioDecode,
@@ -326,6 +328,7 @@ export class OsmiumRemoteSession {
         this.keyboardLocked = false;
         this.heldKeys = new Set();
         this.heldButtons = new Set();
+        this.touchLongPressTimer = null;
         this.gamepadRaf = 0;
         this.lastGamepadSig = "";
 
@@ -1096,6 +1099,17 @@ export class OsmiumRemoteSession {
         this._sendAppPacket(buildInputUnicodeText(text), true);
     }
 
+    sendVirtualKey(vk, down, ext = false) {
+        if (this.viewOnly) return;
+        this._sendAppPacket(buildInputKey(vk, 0, Boolean(down), Boolean(ext)), true);
+    }
+
+    sendKeyTap(vk, ext = false) {
+        if (this.viewOnly) return;
+        this._sendAppPacket(buildInputKey(vk, 0, true, Boolean(ext)), true);
+        this._sendAppPacket(buildInputKey(vk, 0, false, Boolean(ext)), true);
+    }
+
     _startLoopsAndInput() {
         this.pingTimer = setInterval(() => {
             if (!this.disposed) {
@@ -1248,6 +1262,143 @@ export class OsmiumRemoteSession {
             const locked = document.pointerLockElement === this.canvas;
             this._emit("pointerLock", locked);
         });
+
+        let touchMode = "none";
+        let tStartX = 0;
+        let tStartY = 0;
+        let tStartPt = null;
+        let tStartTime = 0;
+        let tLastMidX = 0;
+        let tLastMidY = 0;
+        let tTwoMoved = 0;
+        let tLongPressFired = false;
+
+        const clearLongPress = () => {
+            if (this.touchLongPressTimer) {
+                clearTimeout(this.touchLongPressTimer);
+                this.touchLongPressTimer = null;
+            }
+        };
+
+        const sendClickAt = (pt, btn) => {
+            if (!pt) return;
+            this._sendAppPacket(buildInputMouseMove(true, pt.x, pt.y), false);
+            this._sendAppPacket(buildInputMouseButton(btn, true), true);
+            this._sendAppPacket(buildInputMouseButton(btn, false), true);
+        };
+
+        this._addEvt(this.canvas, "touchstart", (e) => {
+            if (this.disposed || this.viewOnly) return;
+            e.preventDefault();
+            unlockAudio();
+            const touches = e.touches;
+            if (touches.length === 1) {
+                clearLongPress();
+                const tc = touches[0];
+                tStartX = tc.clientX;
+                tStartY = tc.clientY;
+                tStartPt = this._canvasNormalizedCoords(tc);
+                tStartTime = performance.now();
+                tLongPressFired = false;
+                touchMode = "one";
+                if (tStartPt) {
+                    this._sendAppPacket(buildInputMouseMove(true, tStartPt.x, tStartPt.y), false);
+                }
+                this.touchLongPressTimer = setTimeout(() => {
+                    this.touchLongPressTimer = null;
+                    if (touchMode === "one" && !this.disposed && !this.viewOnly) {
+                        tLongPressFired = true;
+                        touchMode = "longpress";
+                        sendClickAt(tStartPt, 3);
+                        try { navigator.vibrate?.(18); } catch {}
+                    }
+                }, 480);
+            } else if (touches.length === 2) {
+                clearLongPress();
+                if (touchMode === "drag" && this.heldButtons.has(1)) {
+                    this.heldButtons.delete(1);
+                    this._sendAppPacket(buildInputMouseButton(1, false), true);
+                }
+                touchMode = "two";
+                tStartTime = performance.now();
+                tTwoMoved = 0;
+                tLastMidX = (touches[0].clientX + touches[1].clientX) / 2;
+                tLastMidY = (touches[0].clientY + touches[1].clientY) / 2;
+                tStartPt = this._canvasNormalizedCoords({ clientX: tLastMidX, clientY: tLastMidY });
+            }
+        }, { passive: false });
+
+        this._addEvt(this.canvas, "touchmove", (e) => {
+            if (this.disposed || this.viewOnly) return;
+            e.preventDefault();
+            const touches = e.touches;
+            if (touches.length === 1 && (touchMode === "one" || touchMode === "drag")) {
+                const tc = touches[0];
+                const dist = Math.hypot(tc.clientX - tStartX, tc.clientY - tStartY);
+                const pt = this._canvasNormalizedCoords(tc);
+                if (touchMode === "one" && dist > 10) {
+                    clearLongPress();
+                    touchMode = "drag";
+                    if (tStartPt) {
+                        this._sendAppPacket(buildInputMouseMove(true, tStartPt.x, tStartPt.y), false);
+                    }
+                    this.heldButtons.add(1);
+                    this._sendAppPacket(buildInputMouseButton(1, true), true);
+                }
+                if (touchMode === "drag" && pt) {
+                    this._sendAppPacket(buildInputMouseMove(true, pt.x, pt.y), false);
+                }
+            } else if (touches.length === 2 && touchMode === "two") {
+                const midX = (touches[0].clientX + touches[1].clientX) / 2;
+                const midY = (touches[0].clientY + touches[1].clientY) / 2;
+                const dx = midX - tLastMidX;
+                const dy = midY - tLastMidY;
+                tLastMidX = midX;
+                tLastMidY = midY;
+                tTwoMoved += Math.hypot(dx, dy);
+                if (tTwoMoved > 8) {
+                    const wheelY = Math.round(dy * 3.2);
+                    const wheelX = Math.round(-dx * 2.4);
+                    if (wheelX !== 0 || wheelY !== 0) {
+                        this._sendAppPacket(buildInputMouseWheel(wheelX, wheelY), true);
+                    }
+                }
+            }
+        }, { passive: false });
+
+        this._addEvt(this.canvas, "touchend", (e) => {
+            if (this.disposed || this.viewOnly) return;
+            e.preventDefault();
+            clearLongPress();
+            if (touchMode === "drag") {
+                if (this.heldButtons.has(1)) {
+                    this.heldButtons.delete(1);
+                    this._sendAppPacket(buildInputMouseButton(1, false), true);
+                }
+            } else if (touchMode === "one" && !tLongPressFired) {
+                const tc = e.changedTouches[0];
+                const pt = tc ? this._canvasNormalizedCoords(tc) : tStartPt;
+                sendClickAt(pt || tStartPt, 1);
+            } else if (touchMode === "two" && e.touches.length === 0) {
+                if (tTwoMoved < 14 && (performance.now() - tStartTime) < 320) {
+                    sendClickAt(tStartPt, 3);
+                }
+            }
+            if (e.touches.length === 0) {
+                touchMode = "none";
+                tLongPressFired = false;
+            }
+        }, { passive: false });
+
+        this._addEvt(this.canvas, "touchcancel", () => {
+            clearLongPress();
+            if (this.heldButtons.has(1)) {
+                this.heldButtons.delete(1);
+                this._sendAppPacket(buildInputMouseButton(1, false), true);
+            }
+            touchMode = "none";
+            tLongPressFired = false;
+        });
     }
 
     _isUiInputFocused() {
@@ -1327,6 +1478,7 @@ export class OsmiumRemoteSession {
         if (this.pingTimer) clearInterval(this.pingTimer);
         if (this.statsTimer) clearInterval(this.statsTimer);
         if (this.idrTimer) clearTimeout(this.idrTimer);
+        if (this.touchLongPressTimer) clearTimeout(this.touchLongPressTimer);
         if (this.relayKeepaliveTimer) clearInterval(this.relayKeepaliveTimer);
         if (this.gamepadRaf) cancelAnimationFrame(this.gamepadRaf);
 

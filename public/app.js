@@ -1345,14 +1345,20 @@ function startRemoteSession(opts) {
     $("tb-display-select").textContent = "";
     syncWinSelect($("tb-display-select"));
 
+    const showMobileKb = !opts.viewOnly && (Boolean(state.caps.hasTouch) || window.matchMedia("(max-width: 820px)").matches);
+    const canFullscreen = typeof $("session-view").requestFullscreen === "function";
     $("tb-btn-mouse").classList.toggle("hidden", opts.viewOnly || !state.caps.hasPointerLock);
     $("tb-btn-mouse").classList.remove("active");
     $("tb-btn-kblock").classList.toggle("hidden", opts.viewOnly || !state.caps.hasKeyboardLock);
     $("tb-btn-kblock").classList.remove("active");
     $("tb-btn-audio").classList.toggle("hidden", !state.caps.canAudioDecode);
     $("tb-btn-audio").classList.toggle("active", Boolean(state.settings.audioEnabled));
+    $("tb-btn-keyboard").classList.toggle("hidden", !showMobileKb);
+    $("tb-btn-keyboard").classList.remove("active");
     $("tb-btn-clipboard").classList.toggle("hidden", opts.viewOnly || !state.settings.clipboardEnabled);
     $("tb-btn-actions").classList.toggle("hidden", opts.viewOnly);
+    $("tb-btn-fullscreen").classList.toggle("hidden", !canFullscreen);
+    hideMobileImeBar();
 
     $("session-loading").classList.remove("hidden");
     $("session-stage-text").textContent = t("session_connecting");
@@ -1437,7 +1443,63 @@ function startRemoteSession(opts) {
     session.start(opts);
 }
 
+const mobileMods = { ctrl: false, alt: false };
+
+function releaseMobileMods() {
+    if (mobileMods.ctrl) {
+        mobileMods.ctrl = false;
+        state.session?.sendVirtualKey(0x11, false, false);
+    }
+    if (mobileMods.alt) {
+        mobileMods.alt = false;
+        state.session?.sendVirtualKey(0x12, false, false);
+    }
+    document.querySelectorAll("[data-mmod]").forEach((btn) => btn.classList.remove("active"));
+}
+
+function updateMobileImeViewportOffset() {
+    const bar = $("mobile-ime-bar");
+    if (!bar || bar.classList.contains("hidden")) return;
+    if (window.visualViewport) {
+        const vv = window.visualViewport;
+        const offset = Math.max(0, Math.round(window.innerHeight - (vv.height + vv.offsetTop)));
+        bar.style.bottom = `${offset}px`;
+    } else {
+        bar.style.bottom = "0px";
+    }
+}
+
+function showMobileImeBar() {
+    const bar = $("mobile-ime-bar");
+    if (!bar) return;
+    bar.classList.remove("hidden");
+    $("tb-btn-keyboard").classList.add("active");
+    updateMobileImeViewportOffset();
+    const inp = $("mobile-ime-input");
+    if (inp) {
+        inp.value = "";
+        inp.focus();
+    }
+}
+
+function hideMobileImeBar() {
+    releaseMobileMods();
+    const bar = $("mobile-ime-bar");
+    if (bar) {
+        bar.classList.add("hidden");
+        bar.style.bottom = "0px";
+    }
+    const btn = $("tb-btn-keyboard");
+    if (btn) btn.classList.remove("active");
+    const inp = $("mobile-ime-input");
+    if (inp) {
+        inp.value = "";
+        inp.blur();
+    }
+}
+
 function exitSessionView() {
+    hideMobileImeBar();
     if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
     }
@@ -1806,6 +1868,66 @@ function bindGlobalUi() {
         state.session.setAudioMuted(nextMuted);
         $("tb-btn-audio").classList.toggle("active", !nextMuted);
     };
+    $("tb-btn-keyboard").onclick = () => {
+        if (!state.session) return;
+        const bar = $("mobile-ime-bar");
+        if (bar.classList.contains("hidden")) showMobileImeBar();
+        else hideMobileImeBar();
+    };
+    $("btn-mobile-ime-hide").onclick = () => hideMobileImeBar();
+    $("mobile-ime-form").onsubmit = (e) => {
+        e.preventDefault();
+        if (!state.session) return;
+        const inp = $("mobile-ime-input");
+        const val = inp.value;
+        if (val) {
+            state.session.sendUnicodeText(val);
+            inp.value = "";
+        } else {
+            state.session.sendKeyTap(0x0D, false);
+        }
+        releaseMobileMods();
+        inp.focus();
+    };
+    $("mobile-ime-input").addEventListener("keydown", (e) => {
+        if (!state.session) return;
+        if (e.key === "Backspace" && $("mobile-ime-input").value === "") {
+            e.preventDefault();
+            state.session.sendKeyTap(0x08, false);
+            releaseMobileMods();
+        }
+    });
+    document.querySelectorAll("[data-mmod]").forEach((btn) => {
+        btn.onclick = () => {
+            if (!state.session) return;
+            const mod = btn.dataset.mmod;
+            const vk = mod === "ctrl" ? 0x11 : 0x12;
+            const next = !mobileMods[mod];
+            mobileMods[mod] = next;
+            btn.classList.toggle("active", next);
+            state.session.sendVirtualKey(vk, next, false);
+        };
+    });
+    const mkeyMap = {
+        esc: [0x1B, false],
+        tab: [0x09, false],
+        win: [0x5B, true],
+        bksp: [0x08, false],
+        enter: [0x0D, false]
+    };
+    document.querySelectorAll("[data-mkey]").forEach((btn) => {
+        btn.onclick = () => {
+            if (!state.session) return;
+            const spec = mkeyMap[btn.dataset.mkey];
+            if (!spec) return;
+            state.session.sendKeyTap(spec[0], spec[1]);
+            releaseMobileMods();
+        };
+    });
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", updateMobileImeViewportOffset);
+        window.visualViewport.addEventListener("scroll", updateMobileImeViewportOffset);
+    }
     $("tb-btn-clipboard").onclick = () => openClipboardDialog();
     $("tb-btn-actions").onclick = () => openSessionActionsDialog();
     $("tb-btn-fullscreen").onclick = async () => {
