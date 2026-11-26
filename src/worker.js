@@ -5,7 +5,7 @@ const OAUTH_COOKIE = "osmium_web_oa";
 const QR_COOKIE = "osmium_web_qr";
 const TWO_FA_COOKIE = "osmium_web_2fa";
 const WEB_CLIENT_VERSION = "1.0.1";
-const SESSION_MAX_AGE_SEC = 30 * 24 * 60 * 60;
+const SESSION_MAX_AGE_SEC = 7 * 24 * 60 * 60;
 const DEVICE_MAX_AGE_SEC = 365 * 24 * 60 * 60;
 const PENDING_MAX_AGE_SEC = 10 * 60;
 
@@ -245,16 +245,25 @@ function getWsOrigin(signalingOrigin) {
     }
 }
 
-async function upstreamFetch(signalingOrigin, path, init = {}) {
+async function upstreamFetch(env, signalingOrigin, path, init = {}) {
     const headers = new Headers(init.headers || {});
     headers.set("Accept", "application/json");
     headers.set("X-Client-Version", WEB_CLIENT_VERSION);
-    const resp = await fetch(`${signalingOrigin}${path}`, {
-        method: init.method || "GET",
-        headers,
-        body: init.body,
-        signal: AbortSignal.timeout(15000)
-    });
+    headers.set("X-Osmium-Client-Scope", "web");
+    const targetUrl = `${signalingOrigin}${path}`;
+    const serviceBinding = env && typeof env.SIGNALING?.fetch === "function" ? env.SIGNALING : null;
+    const resp = serviceBinding
+        ? await serviceBinding.fetch(new Request(targetUrl, {
+              method: init.method || "GET",
+              headers,
+              body: init.body
+          }))
+        : await fetch(targetUrl, {
+              method: init.method || "GET",
+              headers,
+              body: init.body,
+              signal: AbortSignal.timeout(15000)
+          });
     let json = null;
     try {
         json = await resp.json();
@@ -282,8 +291,9 @@ async function createSessionFromUpstream(env, sessionData, deviceId, isSecure) {
     const stoken = typeof sessionData?.stoken === "string" ? sessionData.stoken.trim() : "";
     const ltoken = typeof sessionData?.ltoken === "string" ? sessionData.ltoken.trim() : "";
     const user = extractPublicUser(sessionData);
-    if (!stoken || !ltoken || !user || !user.user_id) return null;
-    const expiresInSec = Number(sessionData.expires_in || 900);
+    if (!stoken.startsWith("wst_") || !ltoken.startsWith("wlt_") || !user || !user.user_id) return null;
+    const expiresInSec = Math.max(60, Number(sessionData.ltoken_expires_in || sessionData.expires_in || 900));
+    const stokenMaxAgeSec = Math.min(SESSION_MAX_AGE_SEC, Math.max(300, Number(sessionData.stoken_expires_in || SESSION_MAX_AGE_SEC)));
     const csrfToken = randomBase64Url(24);
     const payload = {
         stoken,
@@ -292,12 +302,12 @@ async function createSessionFromUpstream(env, sessionData, deviceId, isSecure) {
         userId: user.user_id,
         deviceId,
         csrfToken,
-        exp: Date.now() + SESSION_MAX_AGE_SEC * 1000
+        exp: Date.now() + stokenMaxAgeSec * 1000
     };
     const sealed = await sealCookie(env, SESSION_COOKIE, payload);
     if (!sealed) return null;
     return {
-        cookie: formatSetCookie(SESSION_COOKIE, sealed, SESSION_MAX_AGE_SEC, isSecure),
+        cookie: formatSetCookie(SESSION_COOKIE, sealed, stokenMaxAgeSec, isSecure),
         user,
         csrfToken,
         wsToken: ltoken,
@@ -308,12 +318,12 @@ async function createSessionFromUpstream(env, sessionData, deviceId, isSecure) {
 
 async function resolveActiveSession(env, cookies, signalingOrigin, isSecure, forceRefresh = false) {
     const sess = await openCookie(env, SESSION_COOKIE, cookies[SESSION_COOKIE]);
-    if (!sess || !sess.stoken || !sess.userId || !sess.csrfToken) {
+    if (!sess || typeof sess.stoken !== "string" || !sess.stoken.startsWith("wst_") || !sess.userId || !sess.csrfToken) {
         return { ok: false, clearCookie: cookies[SESSION_COOKIE] ? clearCookie(SESSION_COOKIE, isSecure) : null };
     }
     const now = Date.now();
     const deviceId = /^\d{6,12}$/.test(String(sess.deviceId || "")) ? String(sess.deviceId) : generateNumericDeviceId();
-    if (!forceRefresh && sess.ltoken && typeof sess.ltokenExp === "number" && now < sess.ltokenExp - 120000) {
+    if (!forceRefresh && typeof sess.ltoken === "string" && sess.ltoken.startsWith("wlt_") && typeof sess.ltokenExp === "number" && now < sess.ltokenExp - 120000) {
         return {
             ok: true,
             sess: { ...sess, deviceId },
@@ -322,7 +332,7 @@ async function resolveActiveSession(env, cookies, signalingOrigin, isSecure, for
             user: null
         };
     }
-    const res = await upstreamFetch(signalingOrigin, "/api/auth/ltoken", {
+    const res = await upstreamFetch(env, signalingOrigin, "/api/auth/ltoken", {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
@@ -330,7 +340,7 @@ async function resolveActiveSession(env, cookies, signalingOrigin, isSecure, for
         },
         body: "{}"
     });
-    if (!res.ok || !res.json?.ok || !res.json?.data?.ltoken) {
+    if (!res.ok || !res.json?.ok || typeof res.json?.data?.ltoken !== "string" || !res.json.data.ltoken.startsWith("wlt_")) {
         if (res.status === 401 || res.status === 403) {
             return { ok: false, clearCookie: clearCookie(SESSION_COOKIE, isSecure) };
         }
@@ -386,7 +396,7 @@ async function handleWebApi(request, env, url) {
 
     if (pathname === "/web-api/auth/providers" && method === "GET") {
         try {
-            const res = await upstreamFetch(signalingOrigin, "/api/auth/oauth/providers?platform=web");
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/oauth/providers?platform=web");
             if (!res.ok || !res.json?.ok) {
                 return jsonResponse({ ok: false, code: res.json?.code || 5001 }, res.status || 502, signalingOrigin);
             }
@@ -417,7 +427,7 @@ async function handleWebApi(request, env, url) {
         const dev = await ensureDeviceId(env, cookies, isSecure);
         const setCookies = dev.setCookie ? [dev.setCookie] : [];
         try {
-            const res = await upstreamFetch(signalingOrigin, "/api/auth/login", {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/login", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -488,7 +498,7 @@ async function handleWebApi(request, env, url) {
             return jsonResponse({ ok: false, code: 1006 }, 400, signalingOrigin);
         }
         try {
-            const res = await upstreamFetch(signalingOrigin, "/api/auth/login/2fa/verify", {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/login/2fa/verify", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -559,7 +569,7 @@ async function handleWebApi(request, env, url) {
         const dev = await ensureDeviceId(env, cookies, isSecure);
         const setCookies = dev.setCookie ? [dev.setCookie] : [];
         try {
-            const res = await upstreamFetch(signalingOrigin, "/api/auth/login/key", {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/login/key", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -623,7 +633,7 @@ async function handleWebApi(request, env, url) {
         const prevQr = await openCookie(env, QR_COOKIE, cookies[QR_COOKIE]);
         if (prevQr && prevQr.qrId && prevQr.pollSecret) {
             try {
-                await upstreamFetch(signalingOrigin, "/api/auth/qr/cancel", {
+                await upstreamFetch(env, signalingOrigin, "/api/auth/qr/cancel", {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -634,7 +644,7 @@ async function handleWebApi(request, env, url) {
             } catch {}
         }
         try {
-            const res = await upstreamFetch(signalingOrigin, "/api/auth/qr/create", {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/qr/create", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -702,6 +712,7 @@ async function handleWebApi(request, env, url) {
         }
         try {
             const res = await upstreamFetch(
+                env,
                 signalingOrigin,
                 `/api/auth/qr/status?qid=${encodeURIComponent(qr.qrId)}`,
                 {
@@ -771,7 +782,7 @@ async function handleWebApi(request, env, url) {
         const clr = clearCookie(QR_COOKIE, isSecure);
         if (qr && qr.qrId && qr.pollSecret) {
             try {
-                await upstreamFetch(signalingOrigin, "/api/auth/qr/cancel", {
+                await upstreamFetch(env, signalingOrigin, "/api/auth/qr/cancel", {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -791,6 +802,7 @@ async function handleWebApi(request, env, url) {
         }
         try {
             const res = await upstreamFetch(
+                env,
                 signalingOrigin,
                 `/api/auth/challenge/status?challenge_id=${encodeURIComponent(ch.challengeId)}`,
                 {
@@ -881,7 +893,7 @@ async function handleWebApi(request, env, url) {
         const dev = await ensureDeviceId(env, cookies, isSecure);
         const setCookies = dev.setCookie ? [dev.setCookie] : [];
         try {
-            const res = await upstreamFetch(signalingOrigin, "/api/auth/oauth/start", {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/oauth/start", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -920,18 +932,63 @@ async function handleWebApi(request, env, url) {
         }
     }
 
+    if (pathname === "/web-api/auth/oauth/callback" && method === "GET") {
+        const state = (url.searchParams.get("state") || "").trim();
+        const fc = (url.searchParams.get("fc") || "").trim();
+        const oa = await openCookie(env, OAUTH_COOKIE, cookies[OAUTH_COOKIE]);
+        const valid = Boolean(
+            oa &&
+            typeof oa.state === "string" &&
+            oa.state === state &&
+            fc.length >= 16 &&
+            fc.length <= 128 &&
+            /^[a-zA-Z0-9_-]+$/.test(fc)
+        );
+        const nonce = randomBase64Url(16);
+        const headers = new Headers({
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store, no-cache, must-revalidate, private",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+            "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+            "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'`
+        });
+        if (!valid) {
+            const errHtml = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>授权失败 - Osmium Web</title><style nonce="${nonce}">body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#111315;color:#f3f5f8;text-align:center;padding:24px}</style></head><body><main><h2>授权会话不匹配</h2><p>请关闭此窗口并返回原 Osmium Web 页面重新发起登录。</p></main></body></html>`;
+            return new Response(errHtml, { status: 403, headers });
+        }
+        const remainingMs = typeof oa.exp === "number" ? Math.max(60000, oa.exp - Date.now()) : 300000;
+        const sealed = await sealCookie(env, OAUTH_COOKIE, {
+            ...oa,
+            finishCode: fc
+        });
+        if (sealed) {
+            headers.append("Set-Cookie", formatSetCookie(OAUTH_COOKIE, sealed, Math.floor(remainingMs / 1000), isSecure));
+        }
+        const safePayload = JSON.stringify({ type: "osmium-oauth-done", state, ok: true }).replace(/</g, "\\u003c");
+        const okHtml = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>授权成功 - Osmium Web</title><style nonce="${nonce}">body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#111315;color:#f3f5f8;text-align:center;padding:24px}</style></head><body><main><h2>授权成功</h2><p>正在返回 Osmium Web…</p></main><script nonce="${nonce}">(function(){try{if(window.opener){window.opener.postMessage(${safePayload},window.location.origin);}}catch(_){}setTimeout(function(){try{window.close();}catch(_){}},350);})();</script></body></html>`;
+        return new Response(okHtml, { status: 200, headers });
+    }
+
     if (pathname === "/web-api/auth/oauth/status" && method === "GET") {
         const oa = await openCookie(env, OAUTH_COOKIE, cookies[OAUTH_COOKIE]);
         if (!oa || !oa.state || !oa.pollSecret) {
             return jsonResponse({ ok: false, code: 3017 }, 410, signalingOrigin, [clearCookie(OAUTH_COOKIE, isSecure)]);
         }
         try {
+            const oauthHeaders = { "X-OAuth-Secret": oa.pollSecret };
+            if (typeof oa.finishCode === "string" && oa.finishCode) {
+                oauthHeaders["X-OAuth-Finish-Code"] = oa.finishCode;
+            }
             const res = await upstreamFetch(
+                env,
                 signalingOrigin,
                 `/api/auth/oauth/status?state=${encodeURIComponent(oa.state)}`,
                 {
                     method: "GET",
-                    headers: { "X-OAuth-Secret": oa.pollSecret }
+                    headers: oauthHeaders
                 }
             );
             if (res.ok && res.json?.ok && res.json?.data?.state === "pending") {
@@ -942,6 +999,28 @@ async function handleWebApi(request, env, url) {
                 }, 200, signalingOrigin);
             }
             const clearOa = clearCookie(OAUTH_COOKIE, isSecure);
+            if (
+                res.ok &&
+                res.json?.ok &&
+                (res.json?.code === 102 || res.json?.data?.state === "two_fa_required") &&
+                res.json?.data?.two_fa_token
+            ) {
+                const ttlSec = Math.max(60, Number(res.json.data.expires_in || 300));
+                const twoFaSealed = await sealCookie(env, TWO_FA_COOKIE, {
+                    twoFaToken: String(res.json.data.two_fa_token),
+                    deviceId: oa.deviceId,
+                    exp: Date.now() + ttlSec * 1000
+                });
+                if (!twoFaSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, [clearOa]);
+                return jsonResponse({
+                    ok: true,
+                    code: 102,
+                    data: {
+                        state: "two_fa_required",
+                        expires_in: ttlSec
+                    }
+                }, 200, signalingOrigin, [clearOa, formatSetCookie(TWO_FA_COOKIE, twoFaSealed, ttlSec, isSecure)]);
+            }
             if (res.ok && res.json?.ok && res.json?.data?.state === "completed" && res.json?.data?.session?.stoken) {
                 const built = await createSessionFromUpstream(env, res.json.data.session, oa.deviceId, isSecure);
                 if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, [clearOa]);
@@ -957,7 +1036,7 @@ async function handleWebApi(request, env, url) {
                         deviceId: built.deviceId,
                         signalingUrl: getWsOrigin(signalingOrigin)
                     }
-                }, 200, signalingOrigin, [clearOa, built.cookie]);
+                }, 200, signalingOrigin, [clearOa, clearCookie(TWO_FA_COOKIE, isSecure), clearCookie(QR_COOKIE, isSecure), built.cookie]);
             }
             return jsonResponse({
                 ok: false,
@@ -973,7 +1052,7 @@ async function handleWebApi(request, env, url) {
         const clearOa = clearCookie(OAUTH_COOKIE, isSecure);
         if (oa && oa.state && oa.pollSecret) {
             try {
-                await upstreamFetch(signalingOrigin, "/api/auth/oauth/cancel", {
+                await upstreamFetch(env, signalingOrigin, "/api/auth/oauth/cancel", {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -1000,7 +1079,7 @@ async function handleWebApi(request, env, url) {
         let wsToken = active.ltoken;
         let wsExpiresIn = active.wsExpiresIn || Math.max(60, Math.floor((active.sess.ltokenExp - Date.now()) / 1000));
         if (!user) {
-            const stRes = await upstreamFetch(signalingOrigin, "/api/account/status", {
+            const stRes = await upstreamFetch(env, signalingOrigin, "/api/account/status", {
                 method: "GET",
                 headers: { "X-LToken": wsToken }
             });
@@ -1048,7 +1127,7 @@ async function handleWebApi(request, env, url) {
             return jsonResponse({ ok: false, code: 2001 }, 403, signalingOrigin);
         }
         try {
-            await upstreamFetch(signalingOrigin, "/api/auth/logout", {
+            await upstreamFetch(env, signalingOrigin, "/api/auth/logout", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -1069,7 +1148,7 @@ async function handleWebApi(request, env, url) {
             return jsonResponse({ ok: false, code: 2001 }, 401, signalingOrigin, active.clearCookie ? [active.clearCookie] : []);
         }
         const outCookies = active.rotatedCookie ? [active.rotatedCookie] : [];
-        let res = await upstreamFetch(signalingOrigin, "/api/account/devices", {
+        let res = await upstreamFetch(env, signalingOrigin, "/api/account/devices", {
             method: "GET",
             headers: { "X-LToken": active.ltoken }
         });
@@ -1079,7 +1158,7 @@ async function handleWebApi(request, env, url) {
                 return jsonResponse({ ok: false, code: 2001 }, 401, signalingOrigin, refreshed.clearCookie ? [refreshed.clearCookie] : []);
             }
             if (refreshed.rotatedCookie) outCookies.push(refreshed.rotatedCookie);
-            res = await upstreamFetch(signalingOrigin, "/api/account/devices", {
+            res = await upstreamFetch(env, signalingOrigin, "/api/account/devices", {
                 method: "GET",
                 headers: { "X-LToken": refreshed.ltoken }
             });
@@ -1105,13 +1184,13 @@ async function handleWebApi(request, env, url) {
         }
         const body = await readJsonPayload(request, 4096);
         if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
-        const targetId = String(body.device_id || "").replace(/\D/g, "");
+        const targetId = typeof body.device_id === "string" ? body.device_id.replace(/\s+/g, "") : "";
         const action = typeof body.action === "string" ? body.action.trim().toLowerCase() : "";
         if (!/^\d{6,12}$/.test(targetId) || (action !== "wake" && action !== "shutdown" && action !== "restart")) {
             return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
         }
         const outCookies = active.rotatedCookie ? [active.rotatedCookie] : [];
-        let res = await upstreamFetch(signalingOrigin, "/api/account/devices/power", {
+        let res = await upstreamFetch(env, signalingOrigin, "/api/account/devices/power", {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -1124,7 +1203,7 @@ async function handleWebApi(request, env, url) {
                 const refreshed = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, true);
                 if (refreshed.ok) {
                     if (refreshed.rotatedCookie) outCookies.push(refreshed.rotatedCookie);
-                    res = await upstreamFetch(signalingOrigin, "/api/account/devices/power", {
+                    res = await upstreamFetch(env, signalingOrigin, "/api/account/devices/power", {
                         method: "POST",
                         headers: {
                             "Content-Type": "application/json",
@@ -1148,6 +1227,13 @@ async function handleWebApi(request, env, url) {
 
 export default {
     async fetch(request, env) {
+        const tlsVer = request.cf?.tlsVersion;
+        if (typeof tlsVer === "string" && tlsVer && tlsVer !== "TLSv1.2" && tlsVer !== "TLSv1.3") {
+            return new Response("TLS 1.2 or higher is required.", {
+                status: 426,
+                headers: { "Content-Type": "text/plain; charset=utf-8" }
+            });
+        }
         const url = new URL(request.url);
         const signalingOrigin = getSignalingOrigin(env);
 

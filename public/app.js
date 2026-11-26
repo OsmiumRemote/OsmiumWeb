@@ -966,10 +966,46 @@ async function loadAuthProviders() {
     }
 }
 
+function handleOAuthStatusResult(st) {
+    if (st.ok && st.json?.ok) {
+        const d = st.json.data || {};
+        if (d.state === "completed" && d.user) {
+            stopAuthPolling();
+            enterAuthenticatedApp(d);
+            return "terminal";
+        }
+        if (st.json.code === 102 || d.state === "two_fa_required") {
+            stopAuthPolling();
+            enterTwoFaStep();
+            return "terminal";
+        }
+        if (d.state === "pending") {
+            return "pending";
+        }
+    }
+    stopAuthPolling();
+    setLoginFormDisabled(false);
+    setAuthError(mapApiError(st.json?.code));
+    return "terminal";
+}
+
+async function pollOAuthStatusOnce() {
+    if (state.oauthStatusInFlight || state.user || state.inTwoFa) return "skip";
+    state.oauthStatusInFlight = true;
+    try {
+        const st = await apiRequest("/web-api/auth/oauth/status");
+        if (state.user || state.inTwoFa) return "terminal";
+        return handleOAuthStatusResult(st);
+    } finally {
+        state.oauthStatusInFlight = false;
+    }
+}
+
 async function startOAuthLogin(provider) {
     if (!state.providersAvailable) return;
     setAuthError("");
     stopAuthPolling();
+    state.oauthStatusInFlight = false;
     setLoginFormDisabled(true);
     try {
         const res = await apiRequest("/web-api/auth/oauth/start", {
@@ -990,13 +1026,8 @@ async function startOAuthLogin(provider) {
         const pollInterval = Math.max(1000, Number(res.json.data.poll_interval_ms || 1200));
         let closedTicks = 0;
         const pollOnce = async () => {
-            const st = await apiRequest("/web-api/auth/oauth/status");
-            if (st.ok && st.json?.ok && st.json?.data?.state === "completed") {
-                stopAuthPolling();
-                enterAuthenticatedApp(st.json.data);
-                return;
-            }
-            if (st.ok && st.json?.ok && st.json?.data?.state === "pending") {
+            const outcome = await pollOAuthStatusOnce();
+            if (outcome === "pending") {
                 if (state.authPopup && state.authPopup.closed) {
                     closedTicks++;
                     if (closedTicks >= 2) {
@@ -1006,11 +1037,7 @@ async function startOAuthLogin(provider) {
                         setAuthError(t("err_oauth_cancelled"));
                     }
                 }
-                return;
             }
-            stopAuthPolling();
-            setLoginFormDisabled(false);
-            setAuthError(mapApiError(st.json?.code));
         };
         state.authPollTimer = setInterval(() => {
             pollOnce().catch(() => {});
@@ -2466,15 +2493,13 @@ function bindGlobalUi() {
     });
 
     window.addEventListener("message", async (e) => {
-        if (e.origin !== "https://osmium.fufu.skin" || !e.data || typeof e.data !== "object") return;
+        if (!e.data || typeof e.data !== "object") return;
         if (e.data.type === "osmium-oauth-done") {
-            const st = await apiRequest("/web-api/auth/oauth/status");
-            if (st.ok && st.json?.ok && st.json?.data?.state === "completed") {
-                stopAuthPolling();
-                enterAuthenticatedApp(st.json.data);
-            }
+            if (e.origin !== window.location.origin && e.origin !== "https://osmium.fufu.skin") return;
+            await pollOAuthStatusOnce();
             return;
         }
+        if (e.origin !== "https://osmium.fufu.skin") return;
         if (e.data.type === "osmium-captcha-done") {
             if (state.pendingCaptchaContext) {
                 const retryOpts = state.pendingCaptchaContext;
