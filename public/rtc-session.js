@@ -34,7 +34,7 @@ import {
     parseHostStatusJson
 } from "./protocol.js";
 
-const WEB_CLIENT_VERSION = "1.0.1";
+const WEB_CLIENT_VERSION = "1.0.2";
 const WORKLET_SCRIPT_URL = (typeof document !== "undefined" && document.currentScript && document.currentScript.src)
     ? new URL(document.currentScript.src).pathname
     : "/audio-worklet.js";
@@ -48,7 +48,7 @@ function isPeerVersionSupported(raw) {
     const pat = Number(m[3] || 0);
     if (maj !== 1) return maj > 1;
     if (min !== 0) return min > 0;
-    return pat >= 1;
+    return pat >= 2;
 }
 
 export async function detectBrowserCapabilities() {
