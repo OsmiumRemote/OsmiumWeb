@@ -34,9 +34,22 @@ import {
     parseHostStatusJson
 } from "./protocol.js";
 
+const WEB_CLIENT_VERSION = "1.0.1";
 const WORKLET_SCRIPT_URL = (typeof document !== "undefined" && document.currentScript && document.currentScript.src)
     ? new URL(document.currentScript.src).pathname
     : "/audio-worklet.js";
+
+function isPeerVersionSupported(raw) {
+    if (typeof raw !== "string") return false;
+    const m = raw.trim().replace(/^[vV]/, "").match(/^(\d+)\.(\d+)(?:\.(\d+))?/);
+    if (!m) return false;
+    const maj = Number(m[1]);
+    const min = Number(m[2]);
+    const pat = Number(m[3] || 0);
+    if (maj !== 1) return maj > 1;
+    if (min !== 0) return min > 0;
+    return pat >= 1;
+}
 
 export async function detectBrowserCapabilities() {
     const ua = navigator.userAgent || "";
@@ -162,6 +175,7 @@ export class SignalingHubClient {
                 deviceId: this.deviceId,
                 deviceName: "Osmium Web",
                 osVersion: "Web",
+                clientVersion: WEB_CLIENT_VERSION,
                 allowRemote: false,
                 ltoken: this.ltoken
             });
@@ -425,12 +439,12 @@ export class OsmiumRemoteSession {
                 this.signaling.send({
                     type: "session_version_report",
                     sessionId: this.sessionId,
-                    version: "1.0.0"
+                    version: WEB_CLIENT_VERSION
                 });
                 break;
             }
             case "version_check_result": {
-                if (!msg.compatible) {
+                if (!msg.compatible || (typeof msg.hostVersion === "string" && !isPeerVersionSupported(msg.hostVersion))) {
                     this._fail(t("rtc_err_version_incompatible"));
                     return;
                 }

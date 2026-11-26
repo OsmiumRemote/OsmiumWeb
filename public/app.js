@@ -9,6 +9,7 @@ import {
     SignalingHubClient,
     OsmiumRemoteSession
 } from "./rtc-session.js";
+import { renderQrToCanvas } from "./qr.js";
 
 const SETTINGS_KEY = "osmium_web_prefs_v1";
 const RECENT_KEY = "osmium_web_recent_ids_v1";
@@ -50,6 +51,16 @@ const state = {
     tokenRefreshTimer: null,
     authPollTimer: null,
     authPopup: null,
+    authChallengeKind: "",
+    authMode: "password",
+    inTwoFa: false,
+    qrPollTimer: null,
+    qrCountdownTimer: null,
+    qrExpiresAtMs: 0,
+    qrVisualState: "idle",
+    qrGeneration: 0,
+    qrScannedUser: "",
+    qrScannedAvatar: null,
     pendingCaptchaContext: null,
     session: null,
     lastClipboardFromHost: "",
@@ -167,6 +178,9 @@ function applyLanguage(pref) {
         syncWinSelect(sel);
     });
     if (state.providers.length > 0) renderOAuthButtons();
+    if (!state.user) {
+        refreshWebQrLocalization();
+    }
     if (state.user) {
         renderProfile();
         applyCapabilitiesToUi();
@@ -203,19 +217,24 @@ function mapApiError(code) {
     const c = Number(code);
     if (c === 1004) return t("api_1004");
     if (c === 1005) return t("api_1005");
+    if (c === 1006) return t("api_1006");
     if (c === 2001 || c === 2010) return t("api_2001");
     if (c === 2002 || c === 2004) return t("api_2002");
     if (c === 2005) return t("api_2005");
     if (c === 2009) return t("api_2009");
     if (c === 2012) return t("api_2012");
+    if (c === 2019) return t("api_2019");
     if (c === 3001 || c === 3002 || c === 3006 || c === 3017) return t("api_3001");
     if (c === 3004 || c === 3005) return t("api_3004");
     if (c === 3018) return t("api_3018");
+    if (c === 3019) return t("api_3019");
+    if (c === 3020) return t("api_3020");
     if (c === 4001 || c === 4002 || c === 4003) return t("api_4001");
     if (c === 4006) return t("api_4006");
     if (c === 4011) return t("api_4011");
     if (c === 4012) return t("api_4012");
     if (c === 4013) return t("api_4013");
+    if (c === 4023) return t("api_4023");
     if (c === 5001 || c === 5002 || c === 5003 || c === 5007) return t("api_5001");
     return t("api_default");
 }
@@ -514,6 +533,7 @@ function stopAuthPolling() {
         clearInterval(state.authPollTimer);
         state.authPollTimer = null;
     }
+    state.authChallengeKind = "";
 }
 
 function setAuthError(msg) {
@@ -527,13 +547,391 @@ function setAuthError(msg) {
     }
 }
 
+function setTwoFaError(msg) {
+    const el = $("twofa-error");
+    if (!msg) {
+        el.textContent = "";
+        el.classList.add("hidden");
+    } else {
+        el.textContent = msg;
+        el.classList.remove("hidden");
+    }
+}
+
+function setLoginKeyError(msg) {
+    const el = $("loginkey-error");
+    if (!msg) {
+        el.textContent = "";
+        el.classList.add("hidden");
+    } else {
+        el.textContent = msg;
+        el.classList.remove("hidden");
+    }
+}
+
 function setLoginFormDisabled(disabled) {
     $("login-email").disabled = disabled;
     $("login-password").disabled = disabled;
     $("btn-login-submit").disabled = disabled;
+    $("login-2fa-code").disabled = disabled;
+    $("btn-twofa-submit").disabled = disabled;
+    $("btn-twofa-back").disabled = disabled;
+    $("login-key-input").disabled = disabled;
+    $("btn-loginkey-submit").disabled = disabled;
+    $("tab-auth-password").disabled = disabled;
+    $("tab-auth-key").disabled = disabled;
     $("oauth-buttons").querySelectorAll("button").forEach((b) => {
         b.disabled = disabled;
     });
+}
+
+function setAuthMode(mode) {
+    const next = mode === "key" ? "key" : "password";
+    state.authMode = next;
+    state.inTwoFa = false;
+    setAuthError("");
+    setTwoFaError("");
+    setLoginKeyError("");
+    $("auth-mode-tabs").classList.remove("hidden");
+    $("tab-auth-password").classList.toggle("active", next === "password");
+    $("tab-auth-password").setAttribute("aria-selected", next === "password" ? "true" : "false");
+    $("tab-auth-key").classList.toggle("active", next === "key");
+    $("tab-auth-key").setAttribute("aria-selected", next === "key" ? "true" : "false");
+    $("login-form").classList.toggle("hidden", next !== "password");
+    $("twofa-form").classList.add("hidden");
+    $("loginkey-form").classList.toggle("hidden", next !== "key");
+}
+
+function enterTwoFaStep() {
+    state.inTwoFa = true;
+    setAuthError("");
+    setTwoFaError("");
+    $("auth-mode-tabs").classList.add("hidden");
+    $("login-form").classList.add("hidden");
+    $("loginkey-form").classList.add("hidden");
+    $("twofa-form").classList.remove("hidden");
+    $("login-2fa-code").value = "";
+    setLoginFormDisabled(false);
+    setTimeout(() => $("login-2fa-code").focus(), 40);
+}
+
+function exitTwoFaStep() {
+    state.inTwoFa = false;
+    $("login-2fa-code").value = "";
+    setTwoFaError("");
+    setAuthMode("password");
+}
+
+function stopWebQrLogin(cancelRemote = false) {
+    state.qrGeneration += 1;
+    if (state.qrPollTimer) {
+        clearInterval(state.qrPollTimer);
+        state.qrPollTimer = null;
+    }
+    if (state.qrCountdownTimer) {
+        clearInterval(state.qrCountdownTimer);
+        state.qrCountdownTimer = null;
+    }
+    const prevVisual = state.qrVisualState;
+    state.qrVisualState = "idle";
+    state.qrExpiresAtMs = 0;
+    if (cancelRemote && (prevVisual === "pending" || prevVisual === "scanned" || prevVisual === "awaiting_confirm")) {
+        apiRequest("/web-api/auth/qr/cancel", { method: "POST", body: {} }).catch(() => {});
+    }
+}
+
+function refreshWebQrLocalization() {
+    const st = state.qrVisualState;
+    if (st === "pending") {
+        $("qr-status-text").textContent = t("qr_waiting");
+    } else if (st === "scanned") {
+        $("qr-status-text").textContent = t("qr_scanned");
+        $("qr-overlay-text").textContent = t("qr_scanned");
+    } else if (st === "awaiting_confirm") {
+        $("qr-status-text").textContent = t("qr_awaiting_confirm");
+        $("qr-overlay-text").textContent = t("qr_awaiting_confirm");
+    } else if (st === "expired") {
+        $("qr-status-text").textContent = t("qr_expired");
+        $("qr-overlay-text").textContent = t("qr_expired");
+    } else if (st === "cancelled") {
+        $("qr-status-text").textContent = t("qr_cancelled");
+        $("qr-overlay-text").textContent = t("qr_cancelled");
+    } else if (st === "failed") {
+        $("qr-status-text").textContent = t("qr_failed");
+        $("qr-overlay-text").textContent = t("qr_failed");
+    }
+}
+
+function applyWebQrState(visualState, username = "", avatarData = null) {
+    state.qrVisualState = visualState;
+    state.qrScannedUser = username || "";
+    state.qrScannedAvatar = avatarData || null;
+    const loading = $("qr-loading");
+    const overlay = $("qr-overlay");
+    const avatarHost = $("qr-avatar-host");
+    const avatarSlot = $("qr-avatar-slot");
+    const userEl = $("qr-scanned-user");
+    const overlayText = $("qr-overlay-text");
+    const overlayRefresh = $("btn-qr-overlay-refresh");
+    const statusText = $("qr-status-text");
+
+    if (visualState === "loading") {
+        loading.classList.remove("hidden");
+        overlay.classList.add("hidden");
+        $("qr-countdown").classList.add("hidden");
+        $("btn-qr-refresh").disabled = true;
+        statusText.textContent = t("qr_waiting");
+        return;
+    }
+
+    loading.classList.add("hidden");
+    $("btn-qr-refresh").disabled = false;
+
+    if (visualState === "pending") {
+        overlay.classList.add("hidden");
+        statusText.textContent = t("qr_waiting");
+        return;
+    }
+
+    overlay.classList.remove("hidden");
+    if (visualState === "scanned" || visualState === "awaiting_confirm") {
+        const msg = visualState === "awaiting_confirm" ? t("qr_awaiting_confirm") : t("qr_scanned");
+        statusText.textContent = msg;
+        overlayText.textContent = msg;
+        overlayRefresh.classList.add("hidden");
+        avatarHost.classList.remove("hidden");
+        renderAvatar(avatarSlot, { username: username || "O", avatar_data: avatarData });
+        if (username) {
+            userEl.textContent = username;
+            userEl.classList.remove("hidden");
+        } else {
+            userEl.classList.add("hidden");
+        }
+        return;
+    }
+
+    if (state.qrCountdownTimer) {
+        clearInterval(state.qrCountdownTimer);
+        state.qrCountdownTimer = null;
+    }
+    if (state.qrPollTimer) {
+        clearInterval(state.qrPollTimer);
+        state.qrPollTimer = null;
+    }
+    $("qr-countdown").classList.add("hidden");
+    avatarHost.classList.add("hidden");
+    userEl.classList.add("hidden");
+    overlayRefresh.classList.remove("hidden");
+    const errMsg = visualState === "cancelled"
+        ? t("qr_cancelled")
+        : visualState === "failed"
+            ? t("qr_failed")
+            : t("qr_expired");
+    statusText.textContent = errMsg;
+    overlayText.textContent = errMsg;
+}
+
+function updateQrCountdown() {
+    if (state.qrVisualState !== "pending" && state.qrVisualState !== "scanned" && state.qrVisualState !== "awaiting_confirm") {
+        $("qr-countdown").classList.add("hidden");
+        return;
+    }
+    const rem = Math.ceil((state.qrExpiresAtMs - Date.now()) / 1000);
+    if (rem <= 0) {
+        applyWebQrState("expired");
+        return;
+    }
+    const mm = String(Math.floor(rem / 60)).padStart(2, "0");
+    const ss = String(rem % 60).padStart(2, "0");
+    const el = $("qr-countdown");
+    el.textContent = `${mm}:${ss}`;
+    el.classList.remove("hidden");
+}
+
+function activateWebQrSession(qrData, gen) {
+    if (gen !== state.qrGeneration || state.user) return;
+    if (!qrData || !qrData.qr_url) {
+        applyWebQrState("failed");
+        return;
+    }
+    try {
+        renderQrToCanvas($("qr-canvas"), qrData.qr_url, 360);
+    } catch {
+        applyWebQrState("failed");
+        return;
+    }
+    state.qrExpiresAtMs = Number(qrData.expires_at) > Date.now()
+        ? Number(qrData.expires_at)
+        : Date.now() + Math.max(30, Number(qrData.expires_in || 180)) * 1000;
+    applyWebQrState("pending");
+    updateQrCountdown();
+    if (state.qrCountdownTimer) clearInterval(state.qrCountdownTimer);
+    state.qrCountdownTimer = setInterval(updateQrCountdown, 1000);
+
+    const pollInterval = Math.max(1200, Math.min(3500, Number(qrData.poll_interval_ms || 1500)));
+    let netErrors = 0;
+    const pollQr = async () => {
+        if (gen !== state.qrGeneration || state.user) return;
+        if (Date.now() >= state.qrExpiresAtMs) {
+            applyWebQrState("expired");
+            return;
+        }
+        try {
+            const st = await apiRequest("/web-api/auth/qr/status");
+            if (gen !== state.qrGeneration || state.user) return;
+            if (!st.ok || !st.json?.ok || !st.json?.data) {
+                netErrors += 1;
+                if (netErrors >= 5) applyWebQrState("expired");
+                return;
+            }
+            netErrors = 0;
+            const d = st.json.data;
+            if (Number(d.expires_in) > 0) {
+                state.qrExpiresAtMs = Date.now() + Number(d.expires_in) * 1000;
+            }
+            if (d.state === "confirmed" && d.user) {
+                stopWebQrLogin(false);
+                enterAuthenticatedApp(d);
+                return;
+            }
+            if (d.state === "awaiting_confirm") {
+                applyWebQrState("awaiting_confirm", d.username || "", d.avatar_data || null);
+                return;
+            }
+            if (d.state === "scanned") {
+                applyWebQrState("scanned", "", null);
+                return;
+            }
+            if (d.state === "cancelled") {
+                applyWebQrState("cancelled");
+                return;
+            }
+            if (d.state === "expired") {
+                applyWebQrState("expired");
+            }
+        } catch {
+            netErrors += 1;
+            if (netErrors >= 5) applyWebQrState("expired");
+        }
+    };
+    if (state.qrPollTimer) clearInterval(state.qrPollTimer);
+    state.qrPollTimer = setInterval(() => {
+        pollQr().catch(() => {});
+    }, pollInterval);
+}
+
+async function startWebQrLogin() {
+    stopWebQrLogin(false);
+    const gen = state.qrGeneration;
+    applyWebQrState("loading");
+    try {
+        const res = await apiRequest("/web-api/auth/qr/create", { method: "POST", body: {} });
+        if (gen !== state.qrGeneration || state.user) return;
+        if (res.status === 202 && res.json?.data?.captcha_url) {
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "qr_create", gen);
+            return;
+        }
+        if (res.ok && res.json?.ok && res.json?.data?.qr_url) {
+            activateWebQrSession(res.json.data, gen);
+            return;
+        }
+        applyWebQrState("failed");
+    } catch {
+        if (gen === state.qrGeneration && !state.user) {
+            applyWebQrState("failed");
+        }
+    }
+}
+
+function handleChallengeTerminalStatus(st, kind, qrGen) {
+    if (st.ok && st.json?.ok) {
+        const d = st.json.data || {};
+        if (d.state === "completed" && d.user) {
+            stopAuthPolling();
+            enterAuthenticatedApp(d);
+            return true;
+        }
+        if (st.json.code === 102 || d.state === "two_fa_required") {
+            stopAuthPolling();
+            enterTwoFaStep();
+            return true;
+        }
+        if (d.state === "qr_created" && d.qr_url) {
+            stopAuthPolling();
+            setLoginFormDisabled(false);
+            activateWebQrSession(d, qrGen ?? state.qrGeneration);
+            return true;
+        }
+    }
+    if (st.ok && (st.json?.code === 101 || st.json?.data?.state === "pending")) {
+        return false;
+    }
+    stopAuthPolling();
+    setLoginFormDisabled(false);
+    const code = st.json?.code;
+    const msg = mapApiError(code);
+    if (kind === "qr_create") {
+        applyWebQrState("expired");
+    } else if (kind === "login_2fa") {
+        if (Number(code) === 3020) {
+            exitTwoFaStep();
+            setAuthError(msg);
+        } else {
+            setTwoFaError(msg);
+            $("login-2fa-code").focus();
+        }
+    } else if (kind === "login_key") {
+        setLoginKeyError(msg);
+    } else {
+        setAuthError(msg);
+    }
+    return true;
+}
+
+function runAuthCaptchaChallenge(captchaUrl, kind, qrGen = null) {
+    stopAuthPolling();
+    state.authChallengeKind = kind;
+    state.authPopup = openPopupCentered(captchaUrl, "osmium_captcha", 460, 520);
+    if (!state.authPopup) {
+        if (kind === "qr_create") {
+            applyWebQrState("expired");
+            showToast(t("err_popup_blocked_captcha"));
+        } else if (kind === "login_2fa") {
+            setTwoFaError(t("err_popup_blocked_captcha"));
+            setLoginFormDisabled(false);
+        } else if (kind === "login_key") {
+            setLoginKeyError(t("err_popup_blocked_captcha"));
+            setLoginFormDisabled(false);
+        } else {
+            setAuthError(t("err_popup_blocked_captcha"));
+            setLoginFormDisabled(false);
+        }
+        return;
+    }
+    let closedTicks = 0;
+    const pollChallenge = async () => {
+        const st = await apiRequest("/web-api/auth/challenge/status");
+        if (handleChallengeTerminalStatus(st, kind, qrGen)) return;
+        if (state.authPopup && state.authPopup.closed) {
+            closedTicks += 1;
+            if (closedTicks >= 2) {
+                stopAuthPolling();
+                setLoginFormDisabled(false);
+                if (kind === "qr_create") {
+                    applyWebQrState("expired");
+                } else if (kind === "login_2fa") {
+                    setTwoFaError(t("err_captcha_closed"));
+                } else if (kind === "login_key") {
+                    setLoginKeyError(t("err_captcha_closed"));
+                } else {
+                    setAuthError(t("err_captcha_closed"));
+                }
+            }
+        }
+    };
+    state.authPollTimer = setInterval(() => {
+        pollChallenge().catch(() => {});
+    }, 1200);
 }
 
 function providerIconSvg(provider) {
@@ -641,38 +1039,7 @@ async function handleEmailLoginSubmit(e) {
             body: { email, password }
         });
         if (res.status === 202 && res.json?.data?.captcha_url) {
-            state.authPopup = openPopupCentered(res.json.data.captcha_url, "osmium_captcha", 460, 520);
-            if (!state.authPopup) {
-                setAuthError(t("err_popup_blocked_captcha"));
-                setLoginFormDisabled(false);
-                return;
-            }
-            let closedTicks = 0;
-            const pollChallenge = async () => {
-                const st = await apiRequest("/web-api/auth/challenge/status");
-                if (st.ok && st.json?.ok && st.json?.data?.state === "completed") {
-                    stopAuthPolling();
-                    enterAuthenticatedApp(st.json.data);
-                    return;
-                }
-                if (st.ok && (st.json?.code === 101 || st.json?.data?.state === "pending")) {
-                    if (state.authPopup && state.authPopup.closed) {
-                        closedTicks++;
-                        if (closedTicks >= 2) {
-                            stopAuthPolling();
-                            setLoginFormDisabled(false);
-                            setAuthError(t("err_captcha_closed"));
-                        }
-                    }
-                    return;
-                }
-                stopAuthPolling();
-                setLoginFormDisabled(false);
-                setAuthError(mapApiError(st.json?.code));
-            };
-            state.authPollTimer = setInterval(() => {
-                pollChallenge().catch(() => {});
-            }, 1200);
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "login");
             return;
         }
         if (res.ok && res.json?.ok && res.json?.data?.user) {
@@ -687,8 +1054,84 @@ async function handleEmailLoginSubmit(e) {
     }
 }
 
+async function handleTwoFaSubmit(e) {
+    e.preventDefault();
+    setTwoFaError("");
+    const code = $("login-2fa-code").value.replace(/\s+/g, "");
+    if (!/^\d{6}$/.test(code)) {
+        setTwoFaError(t("err_enter_twofa"));
+        $("login-2fa-code").focus();
+        return;
+    }
+    stopAuthPolling();
+    setLoginFormDisabled(true);
+    try {
+        const res = await apiRequest("/web-api/auth/login/2fa/verify", {
+            method: "POST",
+            body: { code }
+        });
+        if (res.status === 202 && res.json?.data?.captcha_url) {
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "login_2fa");
+            return;
+        }
+        if (res.ok && res.json?.ok && res.json?.data?.user) {
+            enterAuthenticatedApp(res.json.data);
+            return;
+        }
+        const errCode = Number(res.json?.code);
+        const msg = mapApiError(errCode);
+        setLoginFormDisabled(false);
+        if (errCode === 3020 || res.status === 410) {
+            exitTwoFaStep();
+            setAuthError(msg);
+        } else {
+            setTwoFaError(msg);
+            $("login-2fa-code").select();
+            $("login-2fa-code").focus();
+        }
+    } catch {
+        setTwoFaError(t("err_network"));
+        setLoginFormDisabled(false);
+    }
+}
+
+async function handleLoginKeySubmit(e) {
+    e.preventDefault();
+    if (!state.providersAvailable) return;
+    setLoginKeyError("");
+    const loginKey = $("login-key-input").value.trim();
+    if (!loginKey || loginKey.length < 16) {
+        setLoginKeyError(t("err_enter_login_key"));
+        $("login-key-input").focus();
+        return;
+    }
+    stopAuthPolling();
+    setLoginFormDisabled(true);
+    try {
+        const res = await apiRequest("/web-api/auth/login/key", {
+            method: "POST",
+            body: { login_key: loginKey }
+        });
+        if (res.status === 202 && res.json?.data?.captcha_url) {
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "login_key");
+            return;
+        }
+        if (res.ok && res.json?.ok && res.json?.data?.user) {
+            $("login-key-input").value = "";
+            enterAuthenticatedApp(res.json.data);
+            return;
+        }
+        setLoginKeyError(mapApiError(res.json?.code));
+        setLoginFormDisabled(false);
+    } catch {
+        setLoginKeyError(t("err_network"));
+        setLoginFormDisabled(false);
+    }
+}
+
 function showAuthView() {
     stopAuthPolling();
+    stopWebQrLogin(false);
     hideFlyout();
     if (state.tokenRefreshTimer) {
         clearInterval(state.tokenRefreshTimer);
@@ -711,12 +1154,16 @@ function showAuthView() {
     $("app-shell").classList.add("hidden");
     $("auth-view").classList.remove("hidden");
     $("login-password").value = "";
-    setAuthError("");
+    $("login-key-input").value = "";
+    $("login-2fa-code").value = "";
+    setAuthMode("password");
     loadAuthProviders();
+    startWebQrLogin();
 }
 
 function enterAuthenticatedApp(sessionPayload) {
     stopAuthPolling();
+    stopWebQrLogin(false);
     state.user = sessionPayload.user;
     state.csrfToken = sessionPayload.csrfToken || "";
     state.wsToken = sessionPayload.wsToken || "";
@@ -1702,8 +2149,18 @@ function switchSubTab(subtab, nextIndex) {
 }
 
 function bindGlobalUi() {
-    $("btn-retry-providers").onclick = () => loadAuthProviders();
+    $("btn-retry-providers").onclick = () => {
+        loadAuthProviders();
+        startWebQrLogin();
+    };
     $("login-form").onsubmit = handleEmailLoginSubmit;
+    $("twofa-form").onsubmit = handleTwoFaSubmit;
+    $("loginkey-form").onsubmit = handleLoginKeySubmit;
+    $("btn-twofa-back").onclick = () => exitTwoFaStep();
+    $("tab-auth-password").onclick = () => setAuthMode("password");
+    $("tab-auth-key").onclick = () => setAuthMode("key");
+    $("btn-qr-refresh").onclick = () => startWebQrLogin();
+    $("btn-qr-overlay-refresh").onclick = () => startWebQrLogin();
     $("btn-auth-lang").onclick = () => {
         state.settings.language = getLocale() === "en-US" ? "zh-CN" : "en-US";
         saveSettings();
@@ -1714,6 +2171,13 @@ function bindGlobalUi() {
         const inp = $("login-password");
         inp.type = inp.type === "password" ? "text" : "password";
     };
+    $("btn-toggle-login-key").onclick = () => {
+        const inp = $("login-key-input");
+        inp.type = inp.type === "password" ? "text" : "password";
+    };
+    $("login-2fa-code").addEventListener("input", (e) => {
+        e.target.value = e.target.value.replace(/\D/g, "").slice(0, 6);
+    });
     $("btn-toggle-code").onclick = () => {
         const inp = $("target-access-code");
         inp.type = inp.type === "password" ? "text" : "password";
@@ -2023,15 +2487,9 @@ function bindGlobalUi() {
                 }
                 return;
             }
+            const kind = state.authChallengeKind || "login";
             const st = await apiRequest("/web-api/auth/challenge/status");
-            if (st.ok && st.json?.ok && st.json?.data?.state === "completed") {
-                stopAuthPolling();
-                enterAuthenticatedApp(st.json.data);
-            } else if (!st.ok) {
-                stopAuthPolling();
-                setLoginFormDisabled(false);
-                setAuthError(mapApiError(st.json?.code));
-            }
+            handleChallengeTerminalStatus(st, kind, state.qrGeneration);
         }
     });
 }

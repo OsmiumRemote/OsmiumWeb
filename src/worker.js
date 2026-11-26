@@ -2,6 +2,9 @@ const SESSION_COOKIE = "osmium_web_sid";
 const DEVICE_COOKIE = "osmium_web_did";
 const CHALLENGE_COOKIE = "osmium_web_ch";
 const OAUTH_COOKIE = "osmium_web_oa";
+const QR_COOKIE = "osmium_web_qr";
+const TWO_FA_COOKIE = "osmium_web_2fa";
+const WEB_CLIENT_VERSION = "1.0.1";
 const SESSION_MAX_AGE_SEC = 30 * 24 * 60 * 60;
 const DEVICE_MAX_AGE_SEC = 365 * 24 * 60 * 60;
 const PENDING_MAX_AGE_SEC = 10 * 60;
@@ -224,6 +227,7 @@ function extractPublicUser(src) {
         locked: Boolean(src.locked),
         has_email: src.has_email !== false,
         has_password: src.has_password !== false,
+        two_fa_enabled: Boolean(src.two_fa_enabled),
         profile_complete: src.profile_complete !== false
     };
 }
@@ -244,6 +248,7 @@ function getWsOrigin(signalingOrigin) {
 async function upstreamFetch(signalingOrigin, path, init = {}) {
     const headers = new Headers(init.headers || {});
     headers.set("Accept", "application/json");
+    headers.set("X-Client-Version", WEB_CLIENT_VERSION);
     const resp = await fetch(`${signalingOrigin}${path}`, {
         method: init.method || "GET",
         headers,
@@ -429,6 +434,7 @@ async function handleWebApi(request, env, url) {
                     challengeId: String(ch.challenge_id),
                     challengeSecret: String(ch.challenge_secret),
                     deviceId: dev.deviceId,
+                    kind: "login",
                     exp: Date.now() + PENDING_MAX_AGE_SEC * 1000
                 });
                 if (!chSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin);
@@ -446,7 +452,7 @@ async function handleWebApi(request, env, url) {
             if (res.ok && res.json?.ok && res.json?.data?.stoken) {
                 const built = await createSessionFromUpstream(env, res.json.data, dev.deviceId, isSecure);
                 if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin);
-                setCookies.push(built.cookie);
+                setCookies.push(built.cookie, clearCookie(QR_COOKIE, isSecure), clearCookie(TWO_FA_COOKIE, isSecure));
                 return jsonResponse({
                     ok: true,
                     code: 0,
@@ -470,6 +476,314 @@ async function handleWebApi(request, env, url) {
         }
     }
 
+    if (pathname === "/web-api/auth/login/2fa/verify" && method === "POST") {
+        const twoFa = await openCookie(env, TWO_FA_COOKIE, cookies[TWO_FA_COOKIE]);
+        if (!twoFa || !twoFa.twoFaToken) {
+            return jsonResponse({ ok: false, code: 3020 }, 410, signalingOrigin, [clearCookie(TWO_FA_COOKIE, isSecure)]);
+        }
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const code = typeof body.code === "string" ? body.code.replace(/\s+/g, "") : "";
+        if (!/^\d{6}$/.test(code)) {
+            return jsonResponse({ ok: false, code: 1006 }, 400, signalingOrigin);
+        }
+        try {
+            const res = await upstreamFetch(signalingOrigin, "/api/auth/login/2fa/verify", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    two_fa_token: twoFa.twoFaToken,
+                    code
+                })
+            });
+            if (res.status === 202 && res.json?.data?.challenge_id && res.json?.data?.challenge_secret) {
+                const ch = res.json.data;
+                const chSealed = await sealCookie(env, CHALLENGE_COOKIE, {
+                    challengeId: String(ch.challenge_id),
+                    challengeSecret: String(ch.challenge_secret),
+                    deviceId: twoFa.deviceId,
+                    kind: "login_2fa",
+                    exp: Date.now() + PENDING_MAX_AGE_SEC * 1000
+                });
+                if (!chSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin);
+                return jsonResponse({
+                    ok: true,
+                    code: res.json.code || 100,
+                    data: {
+                        challenge_id: String(ch.challenge_id),
+                        captcha_url: appendWebModeToCaptchaUrl(ch.captcha_url),
+                        expires_in: Number(ch.expires_in || 300)
+                    }
+                }, 202, signalingOrigin, [formatSetCookie(CHALLENGE_COOKIE, chSealed, PENDING_MAX_AGE_SEC, isSecure)]);
+            }
+            if (res.ok && res.json?.ok && res.json?.data?.stoken) {
+                const built = await createSessionFromUpstream(env, res.json.data, twoFa.deviceId, isSecure);
+                if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin);
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        user: built.user,
+                        csrfToken: built.csrfToken,
+                        wsToken: built.wsToken,
+                        wsExpiresIn: built.wsExpiresIn,
+                        deviceId: built.deviceId,
+                        signalingUrl: getWsOrigin(signalingOrigin)
+                    }
+                }, 200, signalingOrigin, [
+                    built.cookie,
+                    clearCookie(TWO_FA_COOKIE, isSecure),
+                    clearCookie(QR_COOKIE, isSecure),
+                    clearCookie(CHALLENGE_COOKIE, isSecure)
+                ]);
+            }
+            const errCode = res.json?.code || 3019;
+            const outCookies = errCode === 3020 || res.status === 410 ? [clearCookie(TWO_FA_COOKIE, isSecure)] : [];
+            return jsonResponse({
+                ok: false,
+                code: errCode,
+                data: res.json?.data
+            }, res.status || 400, signalingOrigin, outCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin);
+        }
+    }
+
+    if (pathname === "/web-api/auth/login/key" && method === "POST") {
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const loginKey = typeof body.login_key === "string" ? body.login_key.trim() : "";
+        if (!loginKey || loginKey.length > 128) {
+            return jsonResponse({ ok: false, code: 2019 }, 400, signalingOrigin);
+        }
+        const dev = await ensureDeviceId(env, cookies, isSecure);
+        const setCookies = dev.setCookie ? [dev.setCookie] : [];
+        try {
+            const res = await upstreamFetch(signalingOrigin, "/api/auth/login/key", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    login_key: loginKey,
+                    device_id: dev.deviceId,
+                    device_name: "Osmium Web",
+                    os_version: "Web"
+                })
+            });
+            if (res.status === 202 && res.json?.data?.challenge_id && res.json?.data?.challenge_secret) {
+                const ch = res.json.data;
+                const chSealed = await sealCookie(env, CHALLENGE_COOKIE, {
+                    challengeId: String(ch.challenge_id),
+                    challengeSecret: String(ch.challenge_secret),
+                    deviceId: dev.deviceId,
+                    kind: "login_key",
+                    exp: Date.now() + PENDING_MAX_AGE_SEC * 1000
+                });
+                if (!chSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+                setCookies.push(formatSetCookie(CHALLENGE_COOKIE, chSealed, PENDING_MAX_AGE_SEC, isSecure));
+                return jsonResponse({
+                    ok: true,
+                    code: res.json.code || 100,
+                    data: {
+                        challenge_id: String(ch.challenge_id),
+                        captcha_url: appendWebModeToCaptchaUrl(ch.captcha_url),
+                        expires_in: Number(ch.expires_in || 300)
+                    }
+                }, 202, signalingOrigin, setCookies);
+            }
+            if (res.ok && res.json?.ok && res.json?.data?.stoken) {
+                const built = await createSessionFromUpstream(env, res.json.data, dev.deviceId, isSecure);
+                if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+                setCookies.push(built.cookie, clearCookie(QR_COOKIE, isSecure), clearCookie(TWO_FA_COOKIE, isSecure));
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        user: built.user,
+                        csrfToken: built.csrfToken,
+                        wsToken: built.wsToken,
+                        wsExpiresIn: built.wsExpiresIn,
+                        deviceId: built.deviceId,
+                        signalingUrl: getWsOrigin(signalingOrigin)
+                    }
+                }, 200, signalingOrigin, setCookies);
+            }
+            return jsonResponse({
+                ok: false,
+                code: res.json?.code || 2019,
+                data: res.json?.data
+            }, res.status || 400, signalingOrigin, setCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin, setCookies);
+        }
+    }
+
+    if (pathname === "/web-api/auth/qr/create" && method === "POST") {
+        const dev = await ensureDeviceId(env, cookies, isSecure);
+        const setCookies = dev.setCookie ? [dev.setCookie] : [];
+        const prevQr = await openCookie(env, QR_COOKIE, cookies[QR_COOKIE]);
+        if (prevQr && prevQr.qrId && prevQr.pollSecret) {
+            try {
+                await upstreamFetch(signalingOrigin, "/api/auth/qr/cancel", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-QR-Poll-Secret": prevQr.pollSecret
+                    },
+                    body: JSON.stringify({ qid: prevQr.qrId })
+                });
+            } catch {}
+        }
+        try {
+            const res = await upstreamFetch(signalingOrigin, "/api/auth/qr/create", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    device_id: dev.deviceId,
+                    device_name: "Osmium Web",
+                    os_version: "Web"
+                })
+            });
+            if (res.status === 202 && res.json?.data?.challenge_id && res.json?.data?.challenge_secret) {
+                const ch = res.json.data;
+                const chSealed = await sealCookie(env, CHALLENGE_COOKIE, {
+                    challengeId: String(ch.challenge_id),
+                    challengeSecret: String(ch.challenge_secret),
+                    deviceId: dev.deviceId,
+                    kind: "qr_create",
+                    exp: Date.now() + PENDING_MAX_AGE_SEC * 1000
+                });
+                if (!chSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+                setCookies.push(formatSetCookie(CHALLENGE_COOKIE, chSealed, PENDING_MAX_AGE_SEC, isSecure));
+                return jsonResponse({
+                    ok: true,
+                    code: res.json.code || 100,
+                    data: {
+                        challenge_id: String(ch.challenge_id),
+                        captcha_url: appendWebModeToCaptchaUrl(ch.captcha_url),
+                        expires_in: Number(ch.expires_in || 300)
+                    }
+                }, 202, signalingOrigin, setCookies);
+            }
+            if (res.ok && res.json?.ok && res.json?.data?.qr_id && res.json?.data?.poll_secret) {
+                const d = res.json.data;
+                const ttlSec = Math.max(30, Number(d.expires_in || 180));
+                const qrSealed = await sealCookie(env, QR_COOKIE, {
+                    qrId: String(d.qr_id),
+                    pollSecret: String(d.poll_secret),
+                    deviceId: dev.deviceId,
+                    exp: Number(d.expires_at || Date.now() + ttlSec * 1000)
+                });
+                if (!qrSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+                setCookies.push(formatSetCookie(QR_COOKIE, qrSealed, ttlSec + 30, isSecure));
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        qr_url: String(d.qr_url || ""),
+                        expires_in: ttlSec,
+                        expires_at: Number(d.expires_at || Date.now() + ttlSec * 1000),
+                        poll_interval_ms: Number(d.poll_interval_ms || 1500)
+                    }
+                }, 200, signalingOrigin, setCookies);
+            }
+            return jsonResponse({
+                ok: false,
+                code: res.json?.code || 5001
+            }, res.status || 502, signalingOrigin, setCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin, setCookies);
+        }
+    }
+
+    if (pathname === "/web-api/auth/qr/status" && method === "GET") {
+        const qr = await openCookie(env, QR_COOKIE, cookies[QR_COOKIE]);
+        if (!qr || !qr.qrId || !qr.pollSecret) {
+            return jsonResponse({ ok: true, code: 0, data: { state: "expired", expires_in: 0 } }, 200, signalingOrigin, [clearCookie(QR_COOKIE, isSecure)]);
+        }
+        try {
+            const res = await upstreamFetch(
+                signalingOrigin,
+                `/api/auth/qr/status?qid=${encodeURIComponent(qr.qrId)}`,
+                {
+                    method: "GET",
+                    headers: { "X-QR-Poll-Secret": qr.pollSecret }
+                }
+            );
+            if (!res.ok || !res.json?.ok) {
+                const stCode = res.json?.code;
+                if (stCode === 3016) {
+                    return jsonResponse({ ok: true, code: 0, data: { state: "cancelled", expires_in: 0 } }, 200, signalingOrigin, [clearCookie(QR_COOKIE, isSecure)]);
+                }
+                if (res.status === 404 || res.status === 410 || stCode === 3011 || stCode === 3012) {
+                    return jsonResponse({ ok: true, code: 0, data: { state: "expired", expires_in: 0 } }, 200, signalingOrigin, [clearCookie(QR_COOKIE, isSecure)]);
+                }
+                return jsonResponse({ ok: false, code: stCode || 5001 }, res.status || 502, signalingOrigin);
+            }
+            const d = res.json.data || {};
+            const st = String(d.state || "expired");
+            if (st === "confirmed" && d.session?.stoken) {
+                const built = await createSessionFromUpstream(env, d.session, qr.deviceId, isSecure);
+                if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, [clearCookie(QR_COOKIE, isSecure)]);
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        state: "confirmed",
+                        user: built.user,
+                        csrfToken: built.csrfToken,
+                        wsToken: built.wsToken,
+                        wsExpiresIn: built.wsExpiresIn,
+                        deviceId: built.deviceId,
+                        signalingUrl: getWsOrigin(signalingOrigin)
+                    }
+                }, 200, signalingOrigin, [built.cookie, clearCookie(QR_COOKIE, isSecure), clearCookie(TWO_FA_COOKIE, isSecure)]);
+            }
+            if (st === "expired" || st === "cancelled") {
+                return jsonResponse({ ok: true, code: 0, data: { state: st, expires_in: 0 } }, 200, signalingOrigin, [clearCookie(QR_COOKIE, isSecure)]);
+            }
+            if (st === "awaiting_confirm") {
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        state: "awaiting_confirm",
+                        username: String(d.username || ""),
+                        avatar_data: sanitizeAvatarData(d.avatar_data),
+                        expires_in: Number(d.expires_in || 0)
+                    }
+                }, 200, signalingOrigin);
+            }
+            return jsonResponse({
+                ok: true,
+                code: 0,
+                data: {
+                    state: st === "scanned" ? "scanned" : "pending",
+                    expires_in: Number(d.expires_in || 0)
+                }
+            }, 200, signalingOrigin);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin);
+        }
+    }
+
+    if (pathname === "/web-api/auth/qr/cancel" && method === "POST") {
+        const qr = await openCookie(env, QR_COOKIE, cookies[QR_COOKIE]);
+        const clr = clearCookie(QR_COOKIE, isSecure);
+        if (qr && qr.qrId && qr.pollSecret) {
+            try {
+                await upstreamFetch(signalingOrigin, "/api/auth/qr/cancel", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-QR-Poll-Secret": qr.pollSecret
+                    },
+                    body: JSON.stringify({ qid: qr.qrId })
+                });
+            } catch {}
+        }
+        return jsonResponse({ ok: true, code: 0 }, 200, signalingOrigin, [clr]);
+    }
+
     if (pathname === "/web-api/auth/challenge/status" && method === "GET") {
         const ch = await openCookie(env, CHALLENGE_COOKIE, cookies[CHALLENGE_COOKIE]);
         if (!ch || !ch.challengeId || !ch.challengeSecret) {
@@ -488,6 +802,45 @@ async function handleWebApi(request, env, url) {
                 return jsonResponse({ ok: true, code: 101, data: { state: "pending" } }, 200, signalingOrigin);
             }
             const clearCh = clearCookie(CHALLENGE_COOKIE, isSecure);
+            if (res.json?.code === 102 && res.json?.data?.two_fa_token) {
+                const ttlSec = Math.max(60, Number(res.json.data.expires_in || 300));
+                const twoFaSealed = await sealCookie(env, TWO_FA_COOKIE, {
+                    twoFaToken: String(res.json.data.two_fa_token),
+                    deviceId: ch.deviceId,
+                    exp: Date.now() + ttlSec * 1000
+                });
+                if (!twoFaSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, [clearCh]);
+                return jsonResponse({
+                    ok: true,
+                    code: 102,
+                    data: {
+                        state: "two_fa_required",
+                        expires_in: ttlSec
+                    }
+                }, 200, signalingOrigin, [clearCh, formatSetCookie(TWO_FA_COOKIE, twoFaSealed, ttlSec, isSecure)]);
+            }
+            if (ch.kind === "qr_create" && res.ok && res.json?.ok && res.json?.data?.qr_id && res.json?.data?.poll_secret) {
+                const d = res.json.data;
+                const ttlSec = Math.max(30, Number(d.expires_in || 180));
+                const qrSealed = await sealCookie(env, QR_COOKIE, {
+                    qrId: String(d.qr_id),
+                    pollSecret: String(d.poll_secret),
+                    deviceId: ch.deviceId,
+                    exp: Number(d.expires_at || Date.now() + ttlSec * 1000)
+                });
+                if (!qrSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, [clearCh]);
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        state: "qr_created",
+                        qr_url: String(d.qr_url || ""),
+                        expires_in: ttlSec,
+                        expires_at: Number(d.expires_at || Date.now() + ttlSec * 1000),
+                        poll_interval_ms: Number(d.poll_interval_ms || 1500)
+                    }
+                }, 200, signalingOrigin, [clearCh, formatSetCookie(QR_COOKIE, qrSealed, ttlSec + 30, isSecure)]);
+            }
             if (res.ok && res.json?.ok && res.json?.data?.stoken) {
                 const built = await createSessionFromUpstream(env, res.json.data, ch.deviceId, isSecure);
                 if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, [clearCh]);
@@ -503,13 +856,16 @@ async function handleWebApi(request, env, url) {
                         deviceId: built.deviceId,
                         signalingUrl: getWsOrigin(signalingOrigin)
                     }
-                }, 200, signalingOrigin, [clearCh, built.cookie]);
+                }, 200, signalingOrigin, [clearCh, clearCookie(TWO_FA_COOKIE, isSecure), clearCookie(QR_COOKIE, isSecure), built.cookie]);
             }
+            const errCode = res.json?.code || 2002;
+            const outCookies = [clearCh];
+            if (errCode === 3020) outCookies.push(clearCookie(TWO_FA_COOKIE, isSecure));
             return jsonResponse({
                 ok: false,
-                code: res.json?.code || 2002,
+                code: errCode,
                 data: res.json?.data
-            }, res.status || 400, signalingOrigin, [clearCh]);
+            }, res.status || 400, signalingOrigin, outCookies);
         } catch {
             return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin);
         }
@@ -680,7 +1036,9 @@ async function handleWebApi(request, env, url) {
         const clearAll = [
             clearCookie(SESSION_COOKIE, isSecure),
             clearCookie(CHALLENGE_COOKIE, isSecure),
-            clearCookie(OAUTH_COOKIE, isSecure)
+            clearCookie(OAUTH_COOKIE, isSecure),
+            clearCookie(QR_COOKIE, isSecure),
+            clearCookie(TWO_FA_COOKIE, isSecure)
         ];
         if (!active.ok) {
             return jsonResponse({ ok: true, code: 0 }, 200, signalingOrigin, clearAll);

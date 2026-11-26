@@ -23,37 +23,94 @@
       <span class="ms-brand-name">Osmium Web</span>
     </div>
 
-    <h1 class="ms-title" data-i18n="auth_title">登录</h1>
-    <p class="ms-subtitle" data-i18n="auth_subtitle">使用您的Osmium账号。</p>
-
     <div id="auth-offline-banner" class="win-infobar error hidden">
       <svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="8"/><line x1="10" y1="6" x2="10" y2="10.5"/><circle cx="10" cy="13.5" r="0.8" fill="currentColor" stroke="none"/></svg>
       <span class="infobar-text" data-i18n="auth_offline">暂时无法连接登录服务，当前不可登录</span>
       <button id="btn-retry-providers" type="button" class="win-btn compact" data-i18n="btn_retry">重试</button>
     </div>
 
-    <form id="login-form" class="ms-form" autocomplete="on" novalidate>
-      <div class="ms-input-group">
-        <input id="login-email" class="ms-input" type="email" autocomplete="email" data-i18n-placeholder="ph_email" data-i18n-aria="ph_email" placeholder="电子邮箱地址" aria-label="电子邮箱地址" required>
-      </div>
-
-      <div class="ms-input-group">
-        <div class="ms-password-wrap">
-          <input id="login-password" class="ms-input" type="password" autocomplete="current-password" data-i18n-placeholder="ph_password" data-i18n-aria="ph_password" placeholder="密码" aria-label="密码" required>
-          <button id="btn-toggle-login-pw" type="button" class="input-eye-btn" data-i18n-aria="aria_toggle_pw" aria-label="显示或隐藏密码">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
-          </button>
+    <div class="auth-split-grid">
+      <div class="auth-qr-col">
+        <div class="auth-qr-heading" data-i18n="qr_heading">扫描二维码登录</div>
+        <div class="auth-qr-box">
+          <canvas id="qr-canvas" class="auth-qr-canvas" width="360" height="360"></canvas>
+          <div id="qr-loading" class="auth-qr-loading">
+            <div class="win-spinner" aria-hidden="true"></div>
+          </div>
+          <div id="qr-overlay" class="auth-qr-overlay hidden">
+            <div id="qr-avatar-host" class="auth-qr-avatar-host hidden">
+              <div id="qr-avatar-slot" class="auth-qr-avatar"></div>
+            </div>
+            <div id="qr-scanned-user" class="auth-qr-user hidden"></div>
+            <div id="qr-overlay-text" class="auth-qr-overlay-text"></div>
+            <button id="btn-qr-overlay-refresh" type="button" class="win-btn accent compact hidden" data-i18n="qr_refresh">刷新二维码</button>
+          </div>
+        </div>
+        <div id="qr-status-text" class="auth-qr-status" data-i18n="qr_waiting">请使用手机端Osmium扫码登录</div>
+        <div class="auth-qr-meta">
+          <span id="qr-countdown" class="auth-qr-countdown hidden"></span>
+          <button id="btn-qr-refresh" type="button" class="auth-qr-refresh-link" data-i18n="qr_refresh_short">刷新</button>
         </div>
       </div>
 
-      <div id="auth-error" class="ms-error hidden" role="alert"></div>
+      <div class="auth-vdivider" aria-hidden="true"></div>
 
-      <button id="btn-login-submit" type="submit" class="ms-primary-btn" data-i18n="btn_login">登录</button>
-    </form>
+      <div class="auth-form-col">
+        <div id="auth-mode-tabs" class="auth-mode-tabs" role="tablist">
+          <button id="tab-auth-password" type="button" class="auth-mode-tab active" role="tab" aria-selected="true" data-i18n="auth_tab_password">密码登录</button>
+          <button id="tab-auth-key" type="button" class="auth-mode-tab" role="tab" aria-selected="false" data-i18n="auth_tab_key">密钥登录</button>
+        </div>
 
-    <div id="oauth-section" class="ms-oauth-section hidden">
-      <div class="ms-divider"><span data-i18n="auth_other">其他登录方式</span></div>
-      <div id="oauth-buttons" class="ms-oauth-list"></div>
+        <form id="login-form" class="ms-form" autocomplete="on" novalidate>
+          <div class="ms-input-group">
+            <input id="login-email" class="ms-input" type="email" autocomplete="email" data-i18n-placeholder="ph_email" data-i18n-aria="ph_email" placeholder="电子邮箱地址" aria-label="电子邮箱地址" required>
+          </div>
+
+          <div class="ms-input-group">
+            <div class="ms-password-wrap">
+              <input id="login-password" class="ms-input" type="password" autocomplete="current-password" data-i18n-placeholder="ph_password" data-i18n-aria="ph_password" placeholder="密码" aria-label="密码" required>
+              <button id="btn-toggle-login-pw" type="button" class="input-eye-btn" data-i18n-aria="aria_toggle_pw" aria-label="显示或隐藏密码">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div id="auth-error" class="ms-error hidden" role="alert"></div>
+
+          <button id="btn-login-submit" type="submit" class="ms-primary-btn" data-i18n="btn_login">登录</button>
+        </form>
+
+        <form id="twofa-form" class="ms-form hidden" autocomplete="off" novalidate>
+          <div class="auth-2fa-header">
+            <div class="auth-2fa-title" data-i18n="twofa_title">两步验证</div>
+            <div class="auth-2fa-desc" data-i18n="twofa_desc">请输入身份验证器中的6位动态验证码</div>
+          </div>
+          <div class="ms-input-group">
+            <input id="login-2fa-code" class="ms-input auth-2fa-input" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" data-i18n-placeholder="ph_twofa_code" data-i18n-aria="ph_twofa_code" placeholder="6位验证码" aria-label="6位验证码">
+          </div>
+          <div id="twofa-error" class="ms-error hidden" role="alert"></div>
+          <button id="btn-twofa-submit" type="submit" class="ms-primary-btn" data-i18n="btn_twofa_verify">验证并登录</button>
+          <button id="btn-twofa-back" type="button" class="auth-link-btn" data-i18n="btn_twofa_back">返回密码登录</button>
+        </form>
+
+        <form id="loginkey-form" class="ms-form hidden" autocomplete="off" novalidate>
+          <div class="ms-input-group">
+            <div class="ms-password-wrap">
+              <input id="login-key-input" class="ms-input" type="password" autocomplete="off" maxlength="128" data-i18n-placeholder="ph_login_key" data-i18n-aria="ph_login_key" placeholder="请输入登录密钥" aria-label="请输入登录密钥" required>
+              <button id="btn-toggle-login-key" type="button" class="input-eye-btn" data-i18n-aria="aria_toggle_pw" aria-label="显示或隐藏密码">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="loginkey-error" class="ms-error hidden" role="alert"></div>
+          <button id="btn-loginkey-submit" type="submit" class="ms-primary-btn" data-i18n="btn_loginkey_submit">使用密钥登录</button>
+        </form>
+
+        <div id="oauth-section" class="ms-oauth-section hidden">
+          <div class="ms-divider"><span data-i18n="auth_other">其他登录方式</span></div>
+          <div id="oauth-buttons" class="ms-oauth-list"></div>
+        </div>
+      </div>
     </div>
   </div>
   <div class="auth-lang-bar">
