@@ -15,7 +15,7 @@ const dec = new TextDecoder();
 let cachedKeySecret = "";
 let cachedAesKey = null;
 
-function baseSecurityHeaders(signalingOrigin) {
+function baseSecurityHeaders(signalingOrigin, relayOrigin = "") {
     let wsOrigin = "wss://osmium.fufu.skin";
     let httpsOrigin = "https://osmium.fufu.skin";
     try {
@@ -23,12 +23,24 @@ function baseSecurityHeaders(signalingOrigin) {
         httpsOrigin = u.origin;
         wsOrigin = (u.protocol === "http:" ? "ws://" : "wss://") + u.host;
     } catch {}
+    let relayWsOrigin = "wss://relay.fufu.skin";
+    try {
+        const rRaw = (relayOrigin || "https://relay.fufu.skin").trim();
+        if (rRaw) {
+            const ru = new URL(rRaw);
+            relayWsOrigin = (ru.protocol === "http:" || ru.protocol === "ws:" ? "ws://" : "wss://") + ru.host;
+        }
+    } catch {}
+    const connectSources = ["'self'", wsOrigin];
+    if (relayWsOrigin && relayWsOrigin !== wsOrigin) {
+        connectSources.push(relayWsOrigin);
+    }
     const csp = [
         "default-src 'self'",
         "script-src 'self'",
         "style-src 'self'",
         `img-src 'self' data: blob: ${httpsOrigin}`,
-        `connect-src 'self' ${wsOrigin}`,
+        `connect-src ${connectSources.join(" ")}`,
         "worker-src 'self' blob:",
         "font-src 'self'",
         "object-src 'none'",
@@ -236,6 +248,15 @@ function getSignalingOrigin(env) {
     return String(env.SIGNALING_ORIGIN || "https://osmium.fufu.skin").replace(/\/+$/, "");
 }
 
+function getRelayOrigin(env) {
+    return String(env.RELAY_ORIGIN || "https://relay.fufu.skin").replace(/\/+$/, "");
+}
+
+function getSignalingUpstreamOrigin(env, publicOrigin) {
+    const internal = typeof env?.SIGNALING_INTERNAL_ORIGIN === "string" ? env.SIGNALING_INTERNAL_ORIGIN.trim() : "";
+    return (internal || publicOrigin).replace(/\/+$/, "");
+}
+
 function getWsOrigin(signalingOrigin) {
     try {
         const u = new URL(signalingOrigin);
@@ -250,8 +271,9 @@ async function upstreamFetch(env, signalingOrigin, path, init = {}) {
     headers.set("Accept", "application/json");
     headers.set("X-Client-Version", WEB_CLIENT_VERSION);
     headers.set("X-Osmium-Client-Scope", "web");
-    const targetUrl = `${signalingOrigin}${path}`;
     const serviceBinding = env && typeof env.SIGNALING?.fetch === "function" ? env.SIGNALING : null;
+    const upstreamBase = serviceBinding ? signalingOrigin : getSignalingUpstreamOrigin(env, signalingOrigin);
+    const targetUrl = `${upstreamBase}${path}`;
     const resp = serviceBinding
         ? await serviceBinding.fetch(new Request(targetUrl, {
               method: init.method || "GET",
@@ -1236,6 +1258,7 @@ export default {
         }
         const url = new URL(request.url);
         const signalingOrigin = getSignalingOrigin(env);
+        const relayOrigin = getRelayOrigin(env);
 
         if (url.pathname.startsWith("/web-api/")) {
             return handleWebApi(request, env, url);
@@ -1244,13 +1267,13 @@ export default {
         if (request.method !== "GET" && request.method !== "HEAD") {
             return new Response(null, {
                 status: 405,
-                headers: baseSecurityHeaders(signalingOrigin)
+                headers: baseSecurityHeaders(signalingOrigin, relayOrigin)
             });
         }
 
         const assetResp = await env.ASSETS.fetch(request);
         const headers = new Headers(assetResp.headers);
-        const sec = baseSecurityHeaders(signalingOrigin);
+        const sec = baseSecurityHeaders(signalingOrigin, relayOrigin);
         for (const [k, v] of Object.entries(sec)) {
             headers.set(k, v);
         }

@@ -613,12 +613,27 @@ export class OsmiumRemoteSession {
         return t("reject_default");
     }
 
+    _buildRelayWsUrl(relayPath, relayToken, defaultPath = "/relay") {
+        const raw = typeof relayPath === "string" && relayPath.trim() ? relayPath.trim() : defaultPath;
+        const qs = `sessionId=${encodeURIComponent(this.sessionId)}&role=client&token=${encodeURIComponent(relayToken)}`;
+        if (/^(wss?|https?):\/\//i.test(raw)) {
+            try {
+                const u = new URL(raw);
+                u.protocol = (u.protocol === "http:" || u.protocol === "ws:") ? "ws:" : "wss:";
+                if (!u.pathname || u.pathname === "/") u.pathname = defaultPath;
+                u.search = qs;
+                return u.toString();
+            } catch {}
+        }
+        const base = this.signaling.url.replace(/\/+$/, "");
+        const path = raw.startsWith("/") ? raw : `/${raw}`;
+        return `${base}${path}?${qs}`;
+    }
+
     _startRelayTransport(relayPath, relayToken) {
         if (this.disposed || this.relayWs) return;
         this.transportMode = "relay";
-        const base = this.signaling.url.replace(/\/+$/, "");
-        const path = relayPath.startsWith("/") ? relayPath : `/${relayPath}`;
-        const wsUrl = `${base}${path}?sessionId=${encodeURIComponent(this.sessionId)}&role=client&token=${encodeURIComponent(relayToken)}`;
+        const wsUrl = this._buildRelayWsUrl(relayPath, relayToken, "/relay");
         let ws;
         try {
             ws = new WebSocket(wsUrl);
@@ -681,9 +696,7 @@ export class OsmiumRemoteSession {
 
     _startAudioRelayTransport(relayPath, audioRelayToken) {
         if (this.disposed || this.audioRelayWs || !audioRelayToken) return;
-        const base = this.signaling.url.replace(/\/+$/, "");
-        const path = relayPath.startsWith("/") ? relayPath : `/${relayPath}`;
-        const wsUrl = `${base}${path}?sessionId=${encodeURIComponent(this.sessionId)}&role=client&token=${encodeURIComponent(audioRelayToken)}`;
+        const wsUrl = this._buildRelayWsUrl(relayPath, audioRelayToken, "/relay-audio");
         let ws;
         try {
             ws = new WebSocket(wsUrl);
