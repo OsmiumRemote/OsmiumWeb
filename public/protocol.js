@@ -1,5 +1,5 @@
 const MAGIC = new Uint8Array([0x4f, 0x53, 0x4d, 0x31]);
-const WIRE_VERSION = 1;
+const WIRE_VERSION = 2;
 const WIRE_ENCRYPTED = 0x10;
 const WIRE_PLAIN = 0x11;
 const ROLE_CLIENT = 1;
@@ -15,6 +15,10 @@ export const APP_PKT = Object.freeze({
     VIDEO_CHUNK: 0x20,
     VIDEO_IDR_REQUEST: 0x21,
     AUDIO_FRAME: 0x22,
+    CLIENT_MIC_AUDIO_FRAME: 0x23,
+    AUDIO_PING: 0x24,
+    AUDIO_PONG: 0x25,
+    AUDIO_CONTROL: 0x26,
     INPUT_KEY: 0x30,
     INPUT_MOUSE_MOVE: 0x31,
     INPUT_MOUSE_BUTTON: 0x32,
@@ -28,6 +32,14 @@ export const APP_PKT = Object.freeze({
     HOST_STATUS_JSON: 0x3f,
     AUX_DATA: 0x40
 });
+
+export const AUDIO_FLAG = Object.freeze({
+    STREAM_START: 0x01,
+    SILENCE_END: 0x02,
+    HAS_PREV_REDUNDANT: 0x04
+});
+
+export const AUDIO_PING_FLAG_TELEMETRY = 0x01;
 
 export const VIDEO_CODEC = Object.freeze({
     H264: 1,
@@ -117,6 +129,10 @@ async function hmacSha256(keyBytes, dataBytes) {
     );
     const sig = await crypto.subtle.sign("HMAC", k, dataBytes);
     return new Uint8Array(sig);
+}
+
+export async function deriveAudioAesKey(sessionAesKey32) {
+    return hmacSha256(sessionAesKey32, textEnc.encode("OSM2-AUDIO-KEY"));
 }
 
 export async function computeAccessAuthTag(accessCode, sessionToken16, challengeNonce, clientPub, hostPub) {
@@ -246,10 +262,34 @@ export function buildAuthRequest(authTag32, width, height, fps, bitrateKbps, cod
 }
 
 export function buildPing(timestampUs) {
-    const buf = new Uint8Array(12);
+    const buf = new Uint8Array(20);
     const dv = new DataView(buf.buffer);
     buf[0] = APP_PKT.PING;
     dv.setBigUint64(4, BigInt(Math.max(0, Math.floor(timestampUs))), true);
+    dv.setBigUint64(12, 0n, true);
+    return buf;
+}
+
+export function buildAudioPing(clientTimeUs, lossPermille = 0, playoutBufferMs = 0, jitterMs = 0) {
+    const buf = new Uint8Array(24);
+    const dv = new DataView(buf.buffer);
+    buf[0] = APP_PKT.AUDIO_PING;
+    buf[1] = AUDIO_PING_FLAG_TELEMETRY;
+    dv.setUint16(2, Math.max(0, Math.min(65535, Math.round(jitterMs))), true);
+    dv.setBigUint64(4, BigInt(Math.max(0, Math.floor(clientTimeUs))), true);
+    dv.setBigUint64(12, 0n, true);
+    dv.setUint16(20, Math.max(0, Math.min(1000, Math.round(lossPermille))), true);
+    dv.setUint16(22, Math.max(0, Math.min(65535, Math.round(playoutBufferMs))), true);
+    return buf;
+}
+
+export function buildAudioControl(muted, qualityPreset = 0, targetBitrateKbps = 0) {
+    const buf = new Uint8Array(8);
+    const dv = new DataView(buf.buffer);
+    buf[0] = APP_PKT.AUDIO_CONTROL;
+    buf[4] = muted ? 1 : 0;
+    buf[5] = qualityPreset & 0xff;
+    dv.setUint16(6, Math.max(0, Math.min(65535, targetBitrateKbps | 0)), true);
     return buf;
 }
 
@@ -385,9 +425,21 @@ export function parseAuthResponse(plain) {
 }
 
 export function parsePong(plain) {
-    if (!plain || plain.length < 12) return null;
+    if (!plain || plain.length < 20) return null;
     const dv = new DataView(plain.buffer, plain.byteOffset, plain.byteLength);
-    return { timestampUs: Number(dv.getBigUint64(4, true)) };
+    return {
+        timestampUs: Number(dv.getBigUint64(4, true)),
+        hostTimeUs: Number(dv.getBigUint64(12, true))
+    };
+}
+
+export function parseAudioPong(plain) {
+    if (!plain || plain.length < 24) return null;
+    const dv = new DataView(plain.buffer, plain.byteOffset, plain.byteLength);
+    return {
+        clientTimeUs: Number(dv.getBigUint64(4, true)),
+        hostTimeUs: Number(dv.getBigUint64(12, true))
+    };
 }
 
 export function parseVideoChunk(plain) {
@@ -408,16 +460,32 @@ export function parseVideoChunk(plain) {
 }
 
 export function parseAudioFrame(plain) {
-    if (!plain || plain.length < 16) return null;
+    if (!plain || plain.length < 28) return null;
     const dv = new DataView(plain.buffer, plain.byteOffset, plain.byteLength);
-    const payloadBytes = dv.getUint16(14, true);
-    if (plain.length < 16 + payloadBytes) return null;
+    const flags = plain[1];
+    const sequence = dv.getUint32(4, true);
+    const captureTimeUs = Number(dv.getBigUint64(8, true));
+    const sampleRate = dv.getUint16(16, true);
+    const channels = plain[18];
+    const codecFlags = plain[19];
+    const sampleCount = dv.getUint16(20, true);
+    const payloadBytes = dv.getUint16(22, true);
+    const redundantBytes = dv.getUint16(24, true);
+    if (plain.length < 28 + payloadBytes + redundantBytes) return null;
+    const payload = plain.subarray(28, 28 + payloadBytes);
+    const redundantPayload = (redundantBytes > 0 && (flags & AUDIO_FLAG.HAS_PREV_REDUNDANT) !== 0)
+        ? plain.subarray(28 + payloadBytes, 28 + payloadBytes + redundantBytes)
+        : null;
     return {
-        sequence: dv.getUint32(4, true),
-        sampleRate: dv.getUint16(8, true),
-        channels: plain[10],
-        sampleCount: dv.getUint16(12, true),
-        payload: plain.subarray(16, 16 + payloadBytes)
+        flags,
+        sequence,
+        captureTimeUs,
+        sampleRate,
+        channels,
+        codecFlags,
+        sampleCount,
+        payload,
+        redundantPayload
     };
 }
 

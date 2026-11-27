@@ -1,6 +1,7 @@
 import { t } from "./i18n.js";
 import {
     APP_PKT,
+    AUDIO_FLAG,
     VIDEO_CODEC,
     DOM_CODE_TO_VK,
     OsmiumWireCipher,
@@ -11,9 +12,12 @@ import {
     randomBytes,
     generateClientEcdh,
     deriveSessionAesKey,
+    deriveAudioAesKey,
     computeAccessAuthTag,
     buildAuthRequest,
     buildPing,
+    buildAudioPing,
+    buildAudioControl,
     buildDisconnect,
     buildVideoIdrRequest,
     buildInputKey,
@@ -29,12 +33,13 @@ import {
     buildAuxPacket,
     parseAuthResponse,
     parsePong,
+    parseAudioPong,
     parseVideoChunk,
     parseAudioFrame,
     parseHostStatusJson
 } from "./protocol.js";
 
-const WEB_CLIENT_VERSION = "1.0.2";
+const WEB_CLIENT_VERSION = "1.1.0";
 const WORKLET_SCRIPT_URL = (typeof document !== "undefined" && document.currentScript && document.currentScript.src)
     ? new URL(document.currentScript.src).pathname
     : "/audio-worklet.js";
@@ -45,10 +50,8 @@ function isPeerVersionSupported(raw) {
     if (!m) return false;
     const maj = Number(m[1]);
     const min = Number(m[2]);
-    const pat = Number(m[3] || 0);
     if (maj !== 1) return maj > 1;
-    if (min !== 0) return min > 0;
-    return pat >= 2;
+    return min >= 1;
 }
 
 export async function detectBrowserCapabilities() {
@@ -311,12 +314,17 @@ export class OsmiumRemoteSession {
         this.ecdh = null;
         this.authTag = null;
         this.cipher = null;
+        this.audioCipher = null;
         this.pc = null;
         this.ctrlDc = null;
         this.mediaDc = null;
+        this.audioDc = null;
         this.relayWs = null;
         this.relayReady = false;
         this.relayKeepaliveTimer = null;
+        this.audioRelayWs = null;
+        this.audioRelayReady = false;
+        this.audioRelayKeepaliveTimer = null;
         this.auxClipboard = null;
         this.pendingIce = [];
         this.remoteDescApplied = false;
@@ -337,6 +345,32 @@ export class OsmiumRemoteSession {
         this.audioWorklet = null;
         this.audioDecoder = null;
         this.audioMuted = !settings.audioEnabled;
+        this.audioPingTimer = null;
+        this.audioJitterTimer = null;
+        this.audioJitterMap = new Map();
+        this.audioExpectedSeq = 0;
+        this.audioHasExpectedSeq = false;
+        this.audioPriming = true;
+        this.audioFirstArrivalUs = 0;
+        this.audioLastPopUs = 0;
+        this.audioNeedFadeIn = true;
+        this.audioWorkletBufferedFrames = 0;
+        this.audioJitterUs = 8000;
+        this.audioHasLastArrival = false;
+        this.audioLastArrivalUs = 0;
+        this.audioLastCaptureUs = 0;
+        this.audioStatsExpected = 0;
+        this.audioStatsLost = 0;
+        this.audioStatsWinStartMs = 0;
+        this.audioLossPermille = 0;
+        this.clockOffsetUs = 0;
+        this.bestClockRttUs = 0;
+        this.lastBestRttResetUs = 0;
+        this.hasClockOffset = false;
+        this.videoPresentOffsetUs = 0;
+        this.hasVideoOffset = false;
+        this.lastVideoRenderUs = 0;
+        this.audioPlaybackRate = 1.0;
 
         this.mouseRelative = false;
         this.keyboardLocked = false;
@@ -418,11 +452,16 @@ export class OsmiumRemoteSession {
                         hostPub
                     );
                     const aesKey = await deriveSessionAesKey(this.ecdh.privateKey, hostPub, this.sessionToken);
-                    this.cipher = new OsmiumWireCipher(msg.enableEncryption !== false);
-                    if (this.cipher.enableEncryption) {
+                    const audioAesKey = await deriveAudioAesKey(aesKey);
+                    const encEnabled = msg.enableEncryption !== false;
+                    this.cipher = new OsmiumWireCipher(encEnabled);
+                    this.audioCipher = new OsmiumWireCipher(encEnabled);
+                    if (encEnabled) {
                         await this.cipher.initKeys(aesKey);
+                        await this.audioCipher.initKeys(audioAesKey);
                     }
                     aesKey.fill(0);
+                    audioAesKey.fill(0);
                     this.signaling.send({
                         type: "connect_auth",
                         sessionId: this.sessionId,
@@ -459,27 +498,40 @@ export class OsmiumRemoteSession {
                         type: "bridge_candidates",
                         sessionId: this.sessionId,
                         candidates: [],
-                        transportCaps: []
+                        audioCandidates: [],
+                        transportCaps: ["audio-sep-v2"]
                     });
                 }
                 break;
             }
             case "bridge_ready": {
-                if (this.transportMode) return;
-                const relayToken = typeof msg.relayToken === "string" ? msg.relayToken : "";
-                const relayPath = typeof msg.relayPath === "string" && msg.relayPath ? msg.relayPath : "/relay";
-                if (!relayToken) {
-                    this._fail(t("rtc_err_no_channel"));
-                    return;
+                const audioRelayToken = typeof msg.audioRelayToken === "string" ? msg.audioRelayToken : "";
+                const audioRelayPath = typeof msg.audioRelayPath === "string" && msg.audioRelayPath ? msg.audioRelayPath : "/relay-audio";
+                if (!this.transportMode) {
+                    const relayToken = typeof msg.relayToken === "string" ? msg.relayToken : "";
+                    const relayPath = typeof msg.relayPath === "string" && msg.relayPath ? msg.relayPath : "/relay";
+                    if (!relayToken) {
+                        this._fail(t("rtc_err_no_channel"));
+                        return;
+                    }
+                    this.signaling.send({ type: "relay_fallback", sessionId: this.sessionId, channel: "video" });
+                    this._startRelayTransport(relayPath, relayToken);
                 }
-                this.signaling.send({ type: "relay_fallback", sessionId: this.sessionId });
-                this._startRelayTransport(relayPath, relayToken);
+                if (audioRelayToken && !this.audioRelayWs && this.transportMode !== "p2p") {
+                    this.signaling.send({ type: "relay_fallback", sessionId: this.sessionId, channel: "audio" });
+                    this._startAudioRelayTransport(audioRelayPath, audioRelayToken);
+                }
                 break;
             }
             case "relay_fallback": {
-                if (!this.transportMode && msg.relayToken) {
+                const channel = msg.channel === "audio" ? "audio" : "video";
+                if (channel !== "audio" && !this.transportMode && msg.relayToken) {
                     const relayPath = typeof msg.relayPath === "string" && msg.relayPath ? msg.relayPath : "/relay";
                     this._startRelayTransport(relayPath, msg.relayToken);
+                }
+                if (msg.audioRelayToken && !this.audioRelayWs && this.transportMode !== "p2p") {
+                    const audioRelayPath = typeof msg.audioRelayPath === "string" && msg.audioRelayPath ? msg.audioRelayPath : "/relay-audio";
+                    this._startAudioRelayTransport(audioRelayPath, msg.audioRelayToken);
                 }
                 break;
             }
@@ -627,6 +679,71 @@ export class OsmiumRemoteSession {
         ws.onerror = () => {};
     }
 
+    _startAudioRelayTransport(relayPath, audioRelayToken) {
+        if (this.disposed || this.audioRelayWs || !audioRelayToken) return;
+        const base = this.signaling.url.replace(/\/+$/, "");
+        const path = relayPath.startsWith("/") ? relayPath : `/${relayPath}`;
+        const wsUrl = `${base}${path}?sessionId=${encodeURIComponent(this.sessionId)}&role=client&token=${encodeURIComponent(audioRelayToken)}`;
+        let ws;
+        try {
+            ws = new WebSocket(wsUrl);
+        } catch {
+            return;
+        }
+        ws.binaryType = "arraybuffer";
+        this.audioRelayWs = ws;
+        ws.onopen = () => {
+            if (this.disposed || this.audioRelayWs !== ws) return;
+            this.audioRelayKeepaliveTimer = setInterval(() => {
+                if (this.audioRelayWs && this.audioRelayWs.readyState === WebSocket.OPEN) {
+                    try { this.audioRelayWs.send('{"type":"ping"}'); } catch {}
+                }
+            }, 15000);
+        };
+        ws.onmessage = (ev) => {
+            if (this.disposed || this.audioRelayWs !== ws) return;
+            if (typeof ev.data === "string") {
+                try {
+                    const obj = JSON.parse(ev.data);
+                    if (obj && obj.type === "relay_peer_ready" && !this.audioRelayReady) {
+                        this.audioRelayReady = true;
+                        this._sendAudioPacket(buildAudioControl(this.audioMuted));
+                    }
+                } catch {}
+                return;
+            }
+            if (ev.data instanceof ArrayBuffer) {
+                if (!this.audioRelayReady) {
+                    this.audioRelayReady = true;
+                }
+                const batch = new Uint8Array(ev.data);
+                const dv = new DataView(batch.buffer, batch.byteOffset, batch.byteLength);
+                let pos = 0;
+                while (pos + 2 <= batch.byteLength) {
+                    const pktLen = dv.getUint16(pos, true);
+                    pos += 2;
+                    if (pktLen === 0 || pos + pktLen > batch.byteLength) break;
+                    if (pktLen >= 8 && pktLen <= 32768) {
+                        this._handleIncomingAudioWire(batch.subarray(pos, pos + pktLen));
+                    }
+                    pos += pktLen;
+                }
+            }
+        };
+        // Audio relay close/error is strictly isolated and MUST NEVER affect video or session.
+        ws.onclose = () => {
+            if (this.audioRelayWs === ws) {
+                this.audioRelayWs = null;
+                this.audioRelayReady = false;
+            }
+            if (this.audioRelayKeepaliveTimer) {
+                clearInterval(this.audioRelayKeepaliveTimer);
+                this.audioRelayKeepaliveTimer = null;
+            }
+        };
+        ws.onerror = () => {};
+    }
+
     async _startPeerConnection(stunHost, stunPort) {
         this.transportMode = "p2p";
         this._emit("stage", t("stage_establishing_p2p"));
@@ -666,6 +783,8 @@ export class OsmiumRemoteSession {
         this.ctrlDc.binaryType = "arraybuffer";
         this.mediaDc = pc.createDataChannel("media", { ordered: false, maxRetransmits: 0 });
         this.mediaDc.binaryType = "arraybuffer";
+        this.audioDc = pc.createDataChannel("audio", { ordered: false, maxRetransmits: 0 });
+        this.audioDc.binaryType = "arraybuffer";
 
         const onData = (ev) => {
             if (this.disposed) return;
@@ -676,6 +795,18 @@ export class OsmiumRemoteSession {
 
         this.ctrlDc.onmessage = onData;
         this.mediaDc.onmessage = onData;
+        this.audioDc.onmessage = (ev) => {
+            if (this.disposed) return;
+            if (ev.data instanceof ArrayBuffer) {
+                this._handleIncomingAudioWire(new Uint8Array(ev.data));
+            }
+        };
+        this.audioDc.onopen = () => {
+            if (this.disposed) return;
+            this._sendAudioPacket(buildAudioControl(this.audioMuted));
+        };
+        this.audioDc.onclose = () => {};
+        this.audioDc.onerror = () => {};
 
         this.ctrlDc.onopen = () => {
             if (this.disposed) return;
@@ -759,6 +890,51 @@ export class OsmiumRemoteSession {
         return false;
     }
 
+    async _sendAudioPacket(plainBytes) {
+        if (this.disposed || !this.audioCipher) return false;
+        if (this.transportMode === "relay") {
+            if (!this.audioRelayWs || this.audioRelayWs.readyState !== WebSocket.OPEN) return false;
+            try {
+                const wire = await this.audioCipher.encodePacket(plainBytes);
+                const framed = new Uint8Array(2 + wire.byteLength);
+                new DataView(framed.buffer).setUint16(0, wire.byteLength, true);
+                framed.set(wire, 2);
+                if (this.audioRelayWs && this.audioRelayWs.readyState === WebSocket.OPEN) {
+                    this.audioRelayWs.send(framed);
+                    return true;
+                }
+            } catch {}
+            return false;
+        }
+        if (!this.audioDc || this.audioDc.readyState !== "open") return false;
+        try {
+            const wire = await this.audioCipher.encodePacket(plainBytes);
+            if (this.audioDc && this.audioDc.readyState === "open") {
+                this.audioDc.send(wire);
+                return true;
+            }
+        } catch {}
+        return false;
+    }
+
+    async _handleIncomingAudioWire(wireBytes) {
+        if (!this.audioCipher || this.disposed) return;
+        const plain = await this.audioCipher.decodePacket(wireBytes);
+        if (!plain || plain.length < 4) return;
+        const pktType = plain[0];
+        if (pktType === APP_PKT.AUDIO_FRAME) {
+            this._enqueueAudioFrame(plain);
+            return;
+        }
+        if (pktType === APP_PKT.AUDIO_PONG) {
+            const p = parseAudioPong(plain);
+            if (p && p.clientTimeUs > 0 && p.hostTimeUs > 0) {
+                const nowUs = Math.floor(performance.now() * 1000);
+                this._recordClockOffset(p.clientTimeUs, p.hostTimeUs, nowUs);
+            }
+        }
+    }
+
     async _handleIncomingWire(wireBytes) {
         if (!this.cipher || this.disposed) return;
         this.rxBytesWindow += wireBytes.byteLength;
@@ -770,10 +946,6 @@ export class OsmiumRemoteSession {
             this._handleVideoChunk(plain);
             return;
         }
-        if (pktType === APP_PKT.AUDIO_FRAME) {
-            this._handleAudioFrame(plain);
-            return;
-        }
         if (pktType === APP_PKT.PONG) {
             const p = parsePong(plain);
             if (p && p.timestampUs > 0) {
@@ -781,6 +953,9 @@ export class OsmiumRemoteSession {
                 const rtt = (nowUs - p.timestampUs) / 1000;
                 if (rtt >= 0 && rtt < 10000) {
                     this.rttMs = Math.round(rtt);
+                }
+                if (p.hostTimeUs > 0) {
+                    this._recordClockOffset(p.timestampUs, p.hostTimeUs, nowUs);
                 }
             }
             return;
@@ -906,6 +1081,9 @@ export class OsmiumRemoteSession {
                             }
                             this.ctx2d.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
                             this.decodedFramesWindow++;
+                            if (frame.timestamp > 0) {
+                                this._notifyVideoFrameRendered(frame.timestamp, Math.floor(performance.now() * 1000));
+                            }
                         }
                     } finally {
                         frame.close();
@@ -943,7 +1121,7 @@ export class OsmiumRemoteSession {
         try {
             const chunk = new EncodedVideoChunk({
                 type: meta.isKeyFrame ? "key" : "delta",
-                timestamp: meta.captureTimeUs || Math.floor(performance.now() * 1000),
+                timestamp: meta.captureTimeUs > 0 ? meta.captureTimeUs : 0,
                 data
             });
             this.videoDecoder.decode(chunk);
@@ -967,6 +1145,99 @@ export class OsmiumRemoteSession {
         this._sendAppPacket(buildVideoIdrRequest(), true);
     }
 
+    _recordClockOffset(clientSentUs, hostTimeUs, clientRecvUs) {
+        const rttUs = clientRecvUs - clientSentUs;
+        if (rttUs < 0 || rttUs > 2000000 || hostTimeUs <= 0) return;
+        const sampleOffsetUs = clientRecvUs - (hostTimeUs + rttUs * 0.5);
+        if (!this.hasClockOffset) {
+            this.clockOffsetUs = sampleOffsetUs;
+            this.bestClockRttUs = rttUs;
+            this.lastBestRttResetUs = clientRecvUs;
+            this.hasClockOffset = true;
+            return;
+        }
+        if (clientRecvUs - this.lastBestRttResetUs > 15000000) {
+            this.bestClockRttUs = rttUs;
+            this.lastBestRttResetUs = clientRecvUs;
+        }
+        if (rttUs < this.bestClockRttUs) {
+            this.bestClockRttUs = rttUs;
+        }
+        const diff = sampleOffsetUs - this.clockOffsetUs;
+        if (Math.abs(diff) > 500000) {
+            this.clockOffsetUs = sampleOffsetUs;
+            return;
+        }
+        const alpha = (rttUs <= this.bestClockRttUs + 3000) ? 0.25 : 0.04;
+        this.clockOffsetUs += diff * alpha;
+    }
+
+    _notifyVideoFrameRendered(videoCaptureTimeUs, localRenderUs) {
+        if (videoCaptureTimeUs <= 0) return;
+        const sampleOffset = localRenderUs - videoCaptureTimeUs;
+        if (!this.hasVideoOffset || Math.abs(sampleOffset - this.videoPresentOffsetUs) > 500000) {
+            this.videoPresentOffsetUs = sampleOffset;
+            this.hasVideoOffset = true;
+        } else {
+            this.videoPresentOffsetUs += (sampleOffset - this.videoPresentOffsetUs) * 0.08;
+        }
+        this.lastVideoRenderUs = localRenderUs;
+    }
+
+    _computeAudioTargetBufferUs() {
+        const jitterTarget = Math.min(90000, Math.max(28000, Math.round(this.audioJitterUs * 3.0 + 18000)));
+        return jitterTarget;
+    }
+
+    _updateAvSyncRate(audioCaptureTimeUs) {
+        if (!this.audioWorklet || audioCaptureTimeUs <= 0) return;
+        const nowUs = Math.floor(performance.now() * 1000);
+        const workletBufUs = (this.audioWorkletBufferedFrames / 48000) * 1e6;
+        const rawDacSec = (this.audioCtx ? ((this.audioCtx.outputLatency || 0) + (this.audioCtx.baseLatency || 0.01)) : 0.015);
+        const dacLatencyUs = Math.max(0, Math.min(250000, rawDacSec * 1e6));
+
+        const audioPresentOffsetUs = (nowUs + workletBufUs + dacLatencyUs) - audioCaptureTimeUs;
+        let targetOffsetUs = 0;
+        let hasTarget = false;
+        if (this.hasVideoOffset && (nowUs - this.lastVideoRenderUs) < 2000000) {
+            targetOffsetUs = this.videoPresentOffsetUs;
+            hasTarget = true;
+        } else if (this.hasClockOffset) {
+            targetOffsetUs = this.clockOffsetUs + this._computeAudioTargetBufferUs() + dacLatencyUs;
+            hasTarget = true;
+        }
+        if (!hasTarget) return;
+
+        const avDriftUs = audioPresentOffsetUs - targetOffsetUs;
+        if (avDriftUs > 220000 && this.audioWorkletBufferedFrames > 4800) {
+            const targetFrames = Math.max(1440, Math.min(4800, Math.round((this._computeAudioTargetBufferUs() / 1e6) * 48000)));
+            this.audioWorklet.port.postMessage({ type: "trim", targetFrames });
+            this.audioWorkletBufferedFrames = targetFrames;
+            this.audioPlaybackRate = 1.0;
+            this.audioWorklet.port.postMessage({ type: "rate", rate: 1.0 });
+            return;
+        }
+
+        let desiredRate = 1.0;
+        if (Math.abs(avDriftUs) > 8000) {
+            desiredRate = 1.0 + (avDriftUs / 1000.0) * 0.00025;
+            desiredRate = Math.max(0.985, Math.min(1.015, desiredRate));
+        }
+
+        // Buffer safety rails so A/V sync never starves or bloats the worklet ring
+        if (this.audioWorkletBufferedFrames < 960 && desiredRate > 1.0) {
+            desiredRate = 1.0;
+        } else if (this.audioWorkletBufferedFrames > 7680 && desiredRate < 1.0) {
+            desiredRate = 1.0;
+        }
+
+        this.audioPlaybackRate += (desiredRate - this.audioPlaybackRate) * 0.15;
+        if (Math.abs(this.audioPlaybackRate - 1.0) < 0.0004) {
+            this.audioPlaybackRate = 1.0;
+        }
+        this.audioWorklet.port.postMessage({ type: "rate", rate: this.audioPlaybackRate });
+    }
+
     async _ensureAudioPipeline() {
         if (!this.caps.canAudioDecode || this.audioMuted || this.audioDecoder) return;
         try {
@@ -977,6 +1248,11 @@ export class OsmiumRemoteSession {
                 numberOfOutputs: 1,
                 outputChannelCount: [2]
             });
+            this.audioWorklet.port.onmessage = (ev) => {
+                if (ev.data && ev.data.type === "stats") {
+                    this.audioWorkletBufferedFrames = Number(ev.data.bufferedFrames) || 0;
+                }
+            };
             this.audioWorklet.connect(this.audioCtx.destination);
             this.audioDecoder = new AudioDecoder({
                 output: (audioData) => {
@@ -1006,7 +1282,13 @@ export class OsmiumRemoteSession {
                                 right.set(interleaved);
                             }
                         }
-                        this.audioWorklet.port.postMessage({ type: "pcm", left, right }, [left.buffer, right.buffer]);
+                        if (audioData.timestamp > 0) {
+                            this._updateAvSyncRate(audioData.timestamp);
+                        }
+                        const fadeIn = this.audioNeedFadeIn;
+                        this.audioNeedFadeIn = false;
+                        this.audioWorkletBufferedFrames = Math.min(32768, this.audioWorkletBufferedFrames + frames);
+                        this.audioWorklet.port.postMessage({ type: "pcm", left, right, fadeIn }, [left.buffer, right.buffer]);
                     } catch {} finally {
                         audioData.close();
                     }
@@ -1021,33 +1303,190 @@ export class OsmiumRemoteSession {
         } catch {}
     }
 
-    _handleAudioFrame(plain) {
+    _enqueueAudioFrame(plain) {
         if (!this.caps.canAudioDecode || this.audioMuted) return;
         const frame = parseAudioFrame(plain);
         if (!frame || !frame.payload || frame.payload.byteLength === 0) return;
+
         if (!this.audioDecoder) {
             this._ensureAudioPipeline();
-            return;
         }
         if (this.audioCtx && this.audioCtx.state === "suspended") {
             this.audioCtx.resume().catch(() => {});
         }
-        if (this.audioDecoder.state !== "configured") return;
+
+        const nowUs = Math.floor(performance.now() * 1000);
+        if (this.audioHasLastArrival && frame.captureTimeUs > this.audioLastCaptureUs) {
+            const dArrival = nowUs - this.audioLastArrivalUs;
+            const dCapture = frame.captureTimeUs - this.audioLastCaptureUs;
+            const d = Math.abs(dArrival - dCapture);
+            if (d < 250000) {
+                this.audioJitterUs += (d - this.audioJitterUs) / 16.0;
+            }
+        }
+        this.audioHasLastArrival = true;
+        this.audioLastArrivalUs = nowUs;
+        this.audioLastCaptureUs = frame.captureTimeUs;
+
+        const isStreamStart = (frame.flags & AUDIO_FLAG.STREAM_START) !== 0;
+        if (isStreamStart || !this.audioHasExpectedSeq) {
+            this.audioJitterMap.clear();
+            this.audioExpectedSeq = frame.sequence;
+            this.audioHasExpectedSeq = true;
+            this.audioPriming = true;
+            this.audioFirstArrivalUs = nowUs;
+            this.audioNeedFadeIn = true;
+        } else {
+            const diff = (frame.sequence - this.audioExpectedSeq) | 0;
+            if (diff < -2 || diff > 50) {
+                // Big discontinuity or old late frame
+                if (diff < -2) return;
+                this.audioJitterMap.clear();
+                this.audioExpectedSeq = frame.sequence;
+                this.audioPriming = true;
+                this.audioFirstArrivalUs = nowUs;
+                this.audioNeedFadeIn = true;
+            }
+        }
+
+        if (!this.audioJitterMap.has(frame.sequence)) {
+            this.audioJitterMap.set(frame.sequence, {
+                sequence: frame.sequence,
+                captureTimeUs: frame.captureTimeUs,
+                flags: frame.flags,
+                payload: new Uint8Array(frame.payload),
+                redundantPayload: frame.redundantPayload ? new Uint8Array(frame.redundantPayload) : null,
+                arrivalUs: nowUs
+            });
+        }
+
+        // Recover immediate predecessor from piggybacked redundancy if missing
+        if (frame.redundantPayload && frame.redundantPayload.byteLength > 0 && frame.sequence > 0) {
+            const prevSeq = (frame.sequence - 1) >>> 0;
+            const prevDiff = (prevSeq - this.audioExpectedSeq) | 0;
+            if (prevDiff >= 0 && !this.audioJitterMap.has(prevSeq)) {
+                this.audioJitterMap.set(prevSeq, {
+                    sequence: prevSeq,
+                    captureTimeUs: frame.captureTimeUs > 20000 ? frame.captureTimeUs - 20000 : 0,
+                    flags: 0,
+                    payload: new Uint8Array(frame.redundantPayload),
+                    redundantPayload: null,
+                    arrivalUs: nowUs
+                });
+            }
+        }
+
+        while (this.audioJitterMap.size > 24) {
+            let minSeq = Infinity;
+            for (const k of this.audioJitterMap.keys()) {
+                if (k < minSeq) minSeq = k;
+            }
+            if (minSeq === Infinity) break;
+            this.audioJitterMap.delete(minSeq);
+            if (((this.audioExpectedSeq - minSeq) | 0) <= 0) {
+                this.audioExpectedSeq = (minSeq + 1) >>> 0;
+            }
+        }
+
+        this._pumpAudioJitterBuffer();
+    }
+
+    _decodeOpusBytes(opusBytes, captureTimeUs) {
+        if (!this.audioDecoder || this.audioDecoder.state !== "configured" || !opusBytes || opusBytes.byteLength === 0) {
+            return;
+        }
         try {
             const chunk = new EncodedAudioChunk({
                 type: "key",
-                timestamp: frame.sequence * 20000,
-                data: frame.payload
+                timestamp: captureTimeUs > 0 ? captureTimeUs : 0,
+                data: opusBytes
             });
             this.audioDecoder.decode(chunk);
         } catch {}
     }
 
+    _pumpAudioJitterBuffer() {
+        if (this.disposed || this.audioMuted || !this.audioHasExpectedSeq || this.audioJitterMap.size === 0) return;
+        if (!this.audioDecoder || this.audioDecoder.state !== "configured") return;
+
+        const nowUs = Math.floor(performance.now() * 1000);
+        const nowMs = performance.now();
+        if (this.audioStatsWinStartMs === 0) {
+            this.audioStatsWinStartMs = nowMs;
+        } else if (nowMs - this.audioStatsWinStartMs >= 2000) {
+            if (this.audioStatsExpected > 0) {
+                this.audioLossPermille = Math.min(1000, Math.round((this.audioStatsLost * 1000) / this.audioStatsExpected));
+            } else {
+                this.audioLossPermille = 0;
+            }
+            this.audioStatsExpected = 0;
+            this.audioStatsLost = 0;
+            this.audioStatsWinStartMs = nowMs;
+        }
+
+        if (this.audioPriming) {
+            const waitedUs = nowUs - this.audioFirstArrivalUs;
+            const primeDelayUs = Math.min(50000, Math.max(16000, Math.round(this.audioJitterUs * 1.5)));
+            if (this.audioJitterMap.size < 2 && waitedUs < primeDelayUs) {
+                return;
+            }
+            this.audioPriming = false;
+            this.audioLastPopUs = nowUs;
+        }
+
+        const maxWaitUs = Math.min(70000, Math.max(24000, Math.round(this.audioJitterUs * 2.5 + 16000)));
+        for (let iter = 0; iter < 6; iter++) {
+            const exact = this.audioJitterMap.get(this.audioExpectedSeq);
+            if (exact) {
+                this.audioJitterMap.delete(this.audioExpectedSeq);
+                this.audioExpectedSeq = (this.audioExpectedSeq + 1) >>> 0;
+                this.audioLastPopUs = nowUs;
+                this.audioStatsExpected++;
+                this._decodeOpusBytes(exact.payload, exact.captureTimeUs);
+                continue;
+            }
+            if (this.audioJitterMap.size === 0) break;
+
+            // Find lowest queued sequence ahead of expected
+            let nextSeq = -1;
+            let nextDiff = Infinity;
+            for (const seq of this.audioJitterMap.keys()) {
+                const d = (seq - this.audioExpectedSeq) | 0;
+                if (d > 0 && d < nextDiff) {
+                    nextDiff = d;
+                    nextSeq = seq;
+                }
+            }
+            if (nextSeq < 0) break;
+            const nextSlot = this.audioJitterMap.get(nextSeq);
+            const waitedUs = nowUs - this.audioLastPopUs;
+            if (waitedUs < maxWaitUs && this.audioJitterMap.size < 4) {
+                break;
+            }
+            // Gap exceeded jitter budget: skip lost frame(s) and fade in next clean frame
+            this.audioStatsExpected++;
+            this.audioStatsLost++;
+            this.audioNeedFadeIn = true;
+            this.audioExpectedSeq = (this.audioExpectedSeq + 1) >>> 0;
+            this.audioLastPopUs = nowUs;
+            if (nextDiff > 4 && nextSlot) {
+                this.audioStatsLost += Math.min(10, nextDiff - 1);
+                this.audioStatsExpected += Math.min(10, nextDiff - 1);
+                this.audioExpectedSeq = nextSeq;
+            }
+        }
+    }
+
     setAudioMuted(muted) {
         this.audioMuted = Boolean(muted);
+        this.audioJitterMap.clear();
+        this.audioHasExpectedSeq = false;
+        this.audioPriming = true;
+        this.audioNeedFadeIn = true;
         if (this.audioWorklet) {
             this.audioWorklet.port.postMessage({ type: "mute", muted: this.audioMuted });
         }
+        this._sendAudioPacket(buildAudioControl(this.audioMuted));
         if (!this.audioMuted && !this.audioDecoder) {
             this._ensureAudioPipeline();
         }
@@ -1130,6 +1569,22 @@ export class OsmiumRemoteSession {
                 this._sendAppPacket(buildPing(Math.floor(performance.now() * 1000)), false);
             }
         }, 1500);
+
+        this.audioPingTimer = setInterval(() => {
+            if (!this.disposed) {
+                const bufMs = Math.round((this.audioWorkletBufferedFrames / 48000) * 1000);
+                const jitterMs = Math.round(this.audioJitterUs / 1000);
+                this._sendAudioPacket(
+                    buildAudioPing(Math.floor(performance.now() * 1000), this.audioLossPermille, bufMs, jitterMs)
+                );
+            }
+        }, 300);
+
+        this.audioJitterTimer = setInterval(() => {
+            if (!this.disposed) {
+                this._pumpAudioJitterBuffer();
+            }
+        }, 10);
 
         this.statsTimer = setInterval(() => {
             if (this.disposed) return;
@@ -1490,10 +1945,13 @@ export class OsmiumRemoteSession {
         this.disposed = true;
         if (this.connectTimer) clearTimeout(this.connectTimer);
         if (this.pingTimer) clearInterval(this.pingTimer);
+        if (this.audioPingTimer) clearInterval(this.audioPingTimer);
+        if (this.audioJitterTimer) clearInterval(this.audioJitterTimer);
         if (this.statsTimer) clearInterval(this.statsTimer);
         if (this.idrTimer) clearTimeout(this.idrTimer);
         if (this.touchLongPressTimer) clearTimeout(this.touchLongPressTimer);
         if (this.relayKeepaliveTimer) clearInterval(this.relayKeepaliveTimer);
+        if (this.audioRelayKeepaliveTimer) clearInterval(this.audioRelayKeepaliveTimer);
         if (this.gamepadRaf) cancelAnimationFrame(this.gamepadRaf);
 
         for (const item of this._boundEvents) {
@@ -1522,14 +1980,17 @@ export class OsmiumRemoteSession {
         }
 
         try { this.relayWs?.close(1000); } catch {}
+        try { this.audioRelayWs?.close(1000); } catch {}
         try { this.ctrlDc?.close(); } catch {}
         try { this.mediaDc?.close(); } catch {}
+        try { this.audioDc?.close(); } catch {}
         try { this.pc?.close(); } catch {}
         try { this.videoDecoder?.close(); } catch {}
         try { this.audioDecoder?.close(); } catch {}
         try { this.audioWorklet?.disconnect(); } catch {}
         try { this.audioCtx?.close(); } catch {}
         this.frameBuffers.clear();
+        this.audioJitterMap.clear();
     }
 
     _emit(name, data) {
