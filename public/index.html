@@ -78,6 +78,7 @@
           <div id="auth-error" class="ms-error hidden" role="alert"></div>
 
           <button id="btn-login-submit" type="submit" class="ms-primary-btn" data-i18n="btn_login">登录</button>
+          <button id="btn-open-recovery" type="button" class="auth-link-btn" data-i18n="btn_cant_signin">无法登录？</button>
         </form>
 
         <form id="twofa-form" class="ms-form hidden" autocomplete="off" novalidate>
@@ -104,6 +105,53 @@
           </div>
           <div id="loginkey-error" class="ms-error hidden" role="alert"></div>
           <button id="btn-loginkey-submit" type="submit" class="ms-primary-btn" data-i18n="btn_loginkey_submit">使用密钥登录</button>
+        </form>
+
+        <form id="recovery-form" class="ms-form hidden" autocomplete="off" novalidate>
+          <div class="auth-2fa-header">
+            <div class="auth-2fa-title" data-i18n="rec_title">找回账号</div>
+            <div id="recovery-desc" class="auth-2fa-desc" data-i18n="rec_step0_desc">输入账号邮箱或保密邮箱</div>
+          </div>
+
+          <div id="recovery-step-0" class="ms-input-group">
+            <input id="recovery-lookup-email" class="ms-input" type="email" autocomplete="email" data-i18n-placeholder="ph_email" data-i18n-aria="ph_email" placeholder="电子邮箱地址" aria-label="电子邮箱地址">
+          </div>
+
+          <div id="recovery-step-1" class="ms-form hidden">
+            <div id="recovery-channel-wrap" class="ms-input-group">
+              <select id="recovery-channel" class="win-select full" data-i18n-aria="rec_channel_aria" aria-label="验证邮箱"></select>
+            </div>
+            <div id="recovery-action-wrap" class="ms-input-group hidden">
+              <select id="recovery-action" class="win-select full" data-i18n-aria="rec_action_aria" aria-label="验证后操作">
+                <option value="reset" data-i18n="rec_action_reset">重置密码</option>
+                <option value="login" data-i18n="rec_action_login">登录账号</option>
+              </select>
+            </div>
+            <div id="recovery-masked-hint" class="auth-2fa-desc"></div>
+            <div class="ms-input-group">
+              <input id="recovery-confirm-email" class="ms-input" type="email" autocomplete="off" data-i18n-placeholder="ph_confirm_email" data-i18n-aria="ph_confirm_email" placeholder="输入完整邮箱" aria-label="输入完整邮箱">
+            </div>
+          </div>
+
+          <div id="recovery-step-2" class="ms-form hidden">
+            <div id="recovery-sent-hint" class="auth-2fa-desc"></div>
+            <div class="auth-otp-row">
+              <input id="recovery-otp" class="ms-input" type="text" inputmode="numeric" maxlength="6" data-i18n-placeholder="ph_email_otp" data-i18n-aria="ph_email_otp" placeholder="6位验证码" aria-label="6位验证码">
+              <button id="btn-recovery-resend" type="button" class="win-btn compact" data-i18n="btn_resend_code">重发</button>
+            </div>
+            <div id="recovery-pwd-fields" class="ms-form">
+              <div class="ms-input-group">
+                <input id="recovery-new-password" class="ms-input" type="password" autocomplete="new-password" maxlength="128" data-i18n-placeholder="ph_new_password" data-i18n-aria="ph_new_password" placeholder="新密码（8-128位）" aria-label="新密码（8-128位）">
+              </div>
+              <div class="ms-input-group">
+                <input id="recovery-confirm-password" class="ms-input" type="password" autocomplete="new-password" maxlength="128" data-i18n-placeholder="ph_confirm_password" data-i18n-aria="ph_confirm_password" placeholder="确认新密码" aria-label="确认新密码">
+              </div>
+            </div>
+          </div>
+
+          <div id="recovery-error" class="ms-error hidden" role="alert"></div>
+          <button id="btn-recovery-submit" type="submit" class="ms-primary-btn" data-i18n="rec_btn_next">下一步</button>
+          <button id="btn-recovery-back" type="button" class="auth-link-btn" data-i18n="btn_twofa_back">返回密码登录</button>
         </form>
 
         <div id="oauth-section" class="ms-oauth-section hidden">
@@ -249,6 +297,7 @@
                   <span id="profile-status-badge" class="win-badge ok" data-i18n="account_status_active">正常</span>
                 </div>
                 <div id="profile-email" class="profile-email"></div>
+                <div id="profile-recovery-email" class="profile-email hidden"></div>
               </div>
               <button id="btn-logout" type="button" class="win-btn danger-text" data-i18n="btn_logout">退出登录</button>
             </div>

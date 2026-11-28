@@ -4,7 +4,8 @@ const CHALLENGE_COOKIE = "osmium_web_ch";
 const OAUTH_COOKIE = "osmium_web_oa";
 const QR_COOKIE = "osmium_web_qr";
 const TWO_FA_COOKIE = "osmium_web_2fa";
-const WEB_CLIENT_VERSION = "1.1.0";
+const RECOVERY_COOKIE = "osmium_web_rec";
+const WEB_CLIENT_VERSION = "1.1.1";
 const SESSION_MAX_AGE_SEC = 7 * 24 * 60 * 60;
 const DEVICE_MAX_AGE_SEC = 365 * 24 * 60 * 60;
 const PENDING_MAX_AGE_SEC = 10 * 60;
@@ -234,6 +235,8 @@ function extractPublicUser(src) {
         user_id: String(src.user_id || ""),
         username: String(src.username || "Osmium"),
         email: String(src.email || ""),
+        recovery_email: String(src.recovery_email || ""),
+        has_recovery_email: Boolean(src.has_recovery_email),
         avatar_data: sanitizeAvatarData(src.avatar_data),
         account_status: String(src.account_status || (src.locked ? "locked" : "active")),
         locked: Boolean(src.locked),
@@ -853,6 +856,15 @@ async function handleWebApi(request, env, url) {
                     }
                 }, 200, signalingOrigin, [clearCh, formatSetCookie(TWO_FA_COOKIE, twoFaSealed, ttlSec, isSecure)]);
             }
+            if (ch.kind === "recovery_otp" && res.ok && res.json?.ok) {
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        state: "otp_sent"
+                    }
+                }, 200, signalingOrigin, [clearCh]);
+            }
             if (ch.kind === "qr_create" && res.ok && res.json?.ok && res.json?.data?.qr_id && res.json?.data?.poll_secret) {
                 const d = res.json.data;
                 const ttlSec = Math.max(30, Number(d.expires_in || 180));
@@ -892,9 +904,12 @@ async function handleWebApi(request, env, url) {
                     }
                 }, 200, signalingOrigin, [clearCh, clearCookie(TWO_FA_COOKIE, isSecure), clearCookie(QR_COOKIE, isSecure), built.cookie]);
             }
-            const errCode = res.json?.code || 2002;
+            const errCode = res.json?.code || (res.status >= 500 ? 5001 : 2002);
             const outCookies = [clearCh];
             if (errCode === 3020) outCookies.push(clearCookie(TWO_FA_COOKIE, isSecure));
+            if (ch.kind === "recovery_otp" && (errCode === 3021 || errCode === 3022)) {
+                outCookies.push(clearCookie(RECOVERY_COOKIE, isSecure));
+            }
             return jsonResponse({
                 ok: false,
                 code: errCode,
@@ -1087,6 +1102,268 @@ async function handleWebApi(request, env, url) {
         return jsonResponse({ ok: true, code: 0 }, 200, signalingOrigin, [clearOa]);
     }
 
+    if (pathname === "/web-api/auth/recovery/lookup" && method === "POST") {
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const email = typeof body.email === "string" ? body.email.trim() : "";
+        if (!email || email.length > 254 || !email.includes("@")) {
+            return jsonResponse({ ok: false, code: 1004 }, 400, signalingOrigin);
+        }
+        try {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/recovery/lookup", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ email })
+            });
+            if (!res.ok || !res.json?.ok || !res.json?.data?.recovery_token || !Array.isArray(res.json?.data?.channels)) {
+                return jsonResponse({ ok: false, code: res.json?.code || 5001 }, res.status || 400, signalingOrigin);
+            }
+            const d = res.json.data;
+            const ttlSec = Math.max(60, Math.min(900, Number(d.expires_in || PENDING_MAX_AGE_SEC)));
+            const channels = d.channels
+                .filter((c) => c && (c.channel === "primary" || c.channel === "recovery") && typeof c.masked === "string")
+                .map((c) => ({ channel: c.channel, masked: c.masked }));
+            const recSealed = await sealCookie(env, RECOVERY_COOKIE, {
+                recoveryToken: String(d.recovery_token),
+                channels,
+                exp: Date.now() + ttlSec * 1000
+            });
+            if (!recSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin);
+            return jsonResponse({
+                ok: true,
+                code: 0,
+                data: { channels, expires_in: ttlSec }
+            }, 200, signalingOrigin, [formatSetCookie(RECOVERY_COOKIE, recSealed, ttlSec, isSecure)]);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin);
+        }
+    }
+
+    if (pathname === "/web-api/auth/recovery/reset/send-code" && method === "POST") {
+        const rec = await openCookie(env, RECOVERY_COOKIE, cookies[RECOVERY_COOKIE]);
+        if (!rec || !rec.recoveryToken) {
+            return jsonResponse({ ok: false, code: 3021 }, 410, signalingOrigin, [clearCookie(RECOVERY_COOKIE, isSecure)]);
+        }
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const channel = typeof body.channel === "string" ? body.channel.trim().toLowerCase() : "primary";
+        const confirmEmail = typeof body.confirm_email === "string" ? body.confirm_email.trim() : "";
+        if ((channel !== "primary" && channel !== "recovery") || !confirmEmail || confirmEmail.length > 254 || !confirmEmail.includes("@")) {
+            return jsonResponse({ ok: false, code: 1004 }, 400, signalingOrigin);
+        }
+        const dev = await ensureDeviceId(env, cookies, isSecure);
+        const setCookies = dev.setCookie ? [dev.setCookie] : [];
+        try {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/reset-password/send-code", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    recovery_token: rec.recoveryToken,
+                    channel,
+                    confirm_email: confirmEmail
+                })
+            });
+            if (res.status === 202 && res.json?.data?.challenge_id && res.json?.data?.challenge_secret) {
+                const ch = res.json.data;
+                const chSealed = await sealCookie(env, CHALLENGE_COOKIE, {
+                    challengeId: String(ch.challenge_id),
+                    challengeSecret: String(ch.challenge_secret),
+                    deviceId: dev.deviceId,
+                    kind: "recovery_otp",
+                    exp: Date.now() + PENDING_MAX_AGE_SEC * 1000
+                });
+                if (!chSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+                setCookies.push(formatSetCookie(CHALLENGE_COOKIE, chSealed, PENDING_MAX_AGE_SEC, isSecure));
+                return jsonResponse({
+                    ok: true,
+                    code: res.json.code || 100,
+                    data: {
+                        challenge_id: String(ch.challenge_id),
+                        captcha_url: appendWebModeToCaptchaUrl(ch.captcha_url),
+                        expires_in: Number(ch.expires_in || 300)
+                    }
+                }, 202, signalingOrigin, setCookies);
+            }
+            const errCode = res.json?.code || 5001;
+            if (errCode === 3021 || errCode === 3022) {
+                setCookies.push(clearCookie(RECOVERY_COOKIE, isSecure));
+            }
+            return jsonResponse({ ok: false, code: errCode, data: res.json?.data }, res.status || 400, signalingOrigin, setCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin, setCookies);
+        }
+    }
+
+    if (pathname === "/web-api/auth/recovery/reset/confirm" && method === "POST") {
+        const rec = await openCookie(env, RECOVERY_COOKIE, cookies[RECOVERY_COOKIE]);
+        if (!rec || !rec.recoveryToken) {
+            return jsonResponse({ ok: false, code: 3021 }, 410, signalingOrigin, [clearCookie(RECOVERY_COOKIE, isSecure)]);
+        }
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const channel = typeof body.channel === "string" ? body.channel.trim().toLowerCase() : "primary";
+        const confirmEmail = typeof body.confirm_email === "string" ? body.confirm_email.trim() : "";
+        const code = typeof body.code === "string" ? body.code.replace(/\s+/g, "") : "";
+        const newPassword = typeof body.new_password === "string" ? body.new_password : "";
+        if ((channel !== "primary" && channel !== "recovery") || !confirmEmail || !/^\d{6}$/.test(code) || newPassword.length < 8 || newPassword.length > 128) {
+            return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        }
+        try {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/reset-password/confirm", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    recovery_token: rec.recoveryToken,
+                    channel,
+                    confirm_email: confirmEmail,
+                    code,
+                    new_password: newPassword
+                })
+            });
+            if (res.ok && res.json?.ok) {
+                return jsonResponse({ ok: true, code: 0, data: { reset: true } }, 200, signalingOrigin, [
+                    clearCookie(RECOVERY_COOKIE, isSecure),
+                    clearCookie(CHALLENGE_COOKIE, isSecure)
+                ]);
+            }
+            const errCode = res.json?.code || 5001;
+            const outCookies = errCode === 3021 ? [clearCookie(RECOVERY_COOKIE, isSecure)] : [];
+            return jsonResponse({ ok: false, code: errCode, data: res.json?.data }, res.status || 400, signalingOrigin, outCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin);
+        }
+    }
+
+    if (pathname === "/web-api/auth/recovery/login/send-code" && method === "POST") {
+        const rec = await openCookie(env, RECOVERY_COOKIE, cookies[RECOVERY_COOKIE]);
+        if (!rec || !rec.recoveryToken) {
+            return jsonResponse({ ok: false, code: 3021 }, 410, signalingOrigin, [clearCookie(RECOVERY_COOKIE, isSecure)]);
+        }
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const confirmEmail = typeof body.confirm_email === "string" ? body.confirm_email.trim() : "";
+        if (!confirmEmail || confirmEmail.length > 254 || !confirmEmail.includes("@")) {
+            return jsonResponse({ ok: false, code: 1004 }, 400, signalingOrigin);
+        }
+        const dev = await ensureDeviceId(env, cookies, isSecure);
+        const setCookies = dev.setCookie ? [dev.setCookie] : [];
+        try {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/recovery-login/send-code", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    recovery_token: rec.recoveryToken,
+                    confirm_email: confirmEmail
+                })
+            });
+            if (res.status === 202 && res.json?.data?.challenge_id && res.json?.data?.challenge_secret) {
+                const ch = res.json.data;
+                const chSealed = await sealCookie(env, CHALLENGE_COOKIE, {
+                    challengeId: String(ch.challenge_id),
+                    challengeSecret: String(ch.challenge_secret),
+                    deviceId: dev.deviceId,
+                    kind: "recovery_otp",
+                    exp: Date.now() + PENDING_MAX_AGE_SEC * 1000
+                });
+                if (!chSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+                setCookies.push(formatSetCookie(CHALLENGE_COOKIE, chSealed, PENDING_MAX_AGE_SEC, isSecure));
+                return jsonResponse({
+                    ok: true,
+                    code: res.json.code || 100,
+                    data: {
+                        challenge_id: String(ch.challenge_id),
+                        captcha_url: appendWebModeToCaptchaUrl(ch.captcha_url),
+                        expires_in: Number(ch.expires_in || 300)
+                    }
+                }, 202, signalingOrigin, setCookies);
+            }
+            const errCode = res.json?.code || 5001;
+            if (errCode === 3021 || errCode === 3022) {
+                setCookies.push(clearCookie(RECOVERY_COOKIE, isSecure));
+            }
+            return jsonResponse({ ok: false, code: errCode, data: res.json?.data }, res.status || 400, signalingOrigin, setCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin, setCookies);
+        }
+    }
+
+    if (pathname === "/web-api/auth/recovery/login/confirm" && method === "POST") {
+        const rec = await openCookie(env, RECOVERY_COOKIE, cookies[RECOVERY_COOKIE]);
+        if (!rec || !rec.recoveryToken) {
+            return jsonResponse({ ok: false, code: 3021 }, 410, signalingOrigin, [clearCookie(RECOVERY_COOKIE, isSecure)]);
+        }
+        const body = await readJsonPayload(request, 4096);
+        if (!body) return jsonResponse({ ok: false, code: 1001 }, 400, signalingOrigin);
+        const confirmEmail = typeof body.confirm_email === "string" ? body.confirm_email.trim() : "";
+        const code = typeof body.code === "string" ? body.code.replace(/\s+/g, "") : "";
+        if (!confirmEmail || !/^\d{6}$/.test(code)) {
+            return jsonResponse({ ok: false, code: 1006 }, 400, signalingOrigin);
+        }
+        const dev = await ensureDeviceId(env, cookies, isSecure);
+        const setCookies = dev.setCookie ? [dev.setCookie] : [];
+        try {
+            const res = await upstreamFetch(env, signalingOrigin, "/api/auth/recovery-login/confirm", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    recovery_token: rec.recoveryToken,
+                    confirm_email: confirmEmail,
+                    code,
+                    device_id: dev.deviceId,
+                    device_name: "Osmium Web",
+                    os_version: "Web"
+                })
+            });
+            if ((res.status === 202 || res.json?.code === 102) && res.json?.data?.two_fa_token) {
+                const ttlSec = Math.max(60, Number(res.json.data.expires_in || 300));
+                const twoFaSealed = await sealCookie(env, TWO_FA_COOKIE, {
+                    twoFaToken: String(res.json.data.two_fa_token),
+                    deviceId: dev.deviceId,
+                    exp: Date.now() + ttlSec * 1000
+                });
+                if (!twoFaSealed) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+                setCookies.push(
+                    clearCookie(RECOVERY_COOKIE, isSecure),
+                    clearCookie(CHALLENGE_COOKIE, isSecure),
+                    formatSetCookie(TWO_FA_COOKIE, twoFaSealed, ttlSec, isSecure)
+                );
+                return jsonResponse({
+                    ok: true,
+                    code: 102,
+                    data: { state: "two_fa_required", expires_in: ttlSec }
+                }, 200, signalingOrigin, setCookies);
+            }
+            if (res.ok && res.json?.ok && res.json?.data?.stoken) {
+                const built = await createSessionFromUpstream(env, res.json.data, dev.deviceId, isSecure);
+                if (!built) return jsonResponse({ ok: false, code: 5001 }, 500, signalingOrigin, setCookies);
+                setCookies.push(
+                    built.cookie,
+                    clearCookie(RECOVERY_COOKIE, isSecure),
+                    clearCookie(CHALLENGE_COOKIE, isSecure),
+                    clearCookie(QR_COOKIE, isSecure),
+                    clearCookie(TWO_FA_COOKIE, isSecure)
+                );
+                return jsonResponse({
+                    ok: true,
+                    code: 0,
+                    data: {
+                        user: built.user,
+                        csrfToken: built.csrfToken,
+                        wsToken: built.wsToken,
+                        wsExpiresIn: built.wsExpiresIn,
+                        deviceId: built.deviceId,
+                        signalingUrl: getWsOrigin(signalingOrigin)
+                    }
+                }, 200, signalingOrigin, setCookies);
+            }
+            const errCode = res.json?.code || 5001;
+            if (errCode === 3021) setCookies.push(clearCookie(RECOVERY_COOKIE, isSecure));
+            return jsonResponse({ ok: false, code: errCode, data: res.json?.data }, res.status || 400, signalingOrigin, setCookies);
+        } catch {
+            return jsonResponse({ ok: false, code: 5001 }, 502, signalingOrigin, setCookies);
+        }
+    }
+
     if (pathname === "/web-api/session" && method === "GET") {
         const force = url.searchParams.get("refresh") === "1";
         const active = await resolveActiveSession(env, cookies, signalingOrigin, isSecure, force);
@@ -1139,7 +1416,8 @@ async function handleWebApi(request, env, url) {
             clearCookie(CHALLENGE_COOKIE, isSecure),
             clearCookie(OAUTH_COOKIE, isSecure),
             clearCookie(QR_COOKIE, isSecure),
-            clearCookie(TWO_FA_COOKIE, isSecure)
+            clearCookie(TWO_FA_COOKIE, isSecure),
+            clearCookie(RECOVERY_COOKIE, isSecure)
         ];
         if (!active.ok) {
             return jsonResponse({ ok: true, code: 0 }, 200, signalingOrigin, clearAll);

@@ -39,7 +39,7 @@ import {
     parseHostStatusJson
 } from "./protocol.js";
 
-const WEB_CLIENT_VERSION = "1.1.0";
+const WEB_CLIENT_VERSION = "1.1.1";
 const WORKLET_SCRIPT_URL = (typeof document !== "undefined" && document.currentScript && document.currentScript.src)
     ? new URL(document.currentScript.src).pathname
     : "/audio-worklet.js";
@@ -50,8 +50,10 @@ function isPeerVersionSupported(raw) {
     if (!m) return false;
     const maj = Number(m[1]);
     const min = Number(m[2]);
+    const pat = Number(m[3] || 0);
     if (maj !== 1) return maj > 1;
-    return min >= 1;
+    if (min !== 1) return min > 1;
+    return pat >= 1;
 }
 
 export async function detectBrowserCapabilities() {
@@ -604,7 +606,7 @@ export class OsmiumRemoteSession {
         if (s === "ENCRYPTION_MISMATCH") return t("reject_enc_mismatch");
         if (s === "2011" || s === "BLACKLISTED_BY_HOST") return t("reject_blacklisted");
         if (s === "4005" || s === "CONNECT_COOLDOWN") {
-            const sec = Math.max(1, Math.ceil((cooldownMs || 7000) / 1000));
+            const sec = Math.max(1, Math.ceil((cooldownMs || 2000) / 1000));
             return t("reject_cooldown", { sec });
         }
         if (s === "2010" || s === "ACCOUNT_AUTH_REQUIRED") return t("reject_auth_expired");

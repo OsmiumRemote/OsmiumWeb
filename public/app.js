@@ -52,8 +52,19 @@ const state = {
     authPollTimer: null,
     authPopup: null,
     authChallengeKind: "",
+    authChallengeId: "",
+    authChallengeGen: 0,
+    authChallengeQrGen: null,
+    authChallengeInFlight: false,
+    authChallengeQueued: false,
     authMode: "password",
     inTwoFa: false,
+    inRecovery: false,
+    recoveryStep: 0,
+    recoveryChannels: [],
+    recoveryCooldownUntil: 0,
+    recoveryCooldownTimer: null,
+    recoveryPendingAdvance: false,
     qrPollTimer: null,
     qrCountdownTimer: null,
     qrExpiresAtMs: 0,
@@ -180,6 +191,9 @@ function applyLanguage(pref) {
     if (state.providers.length > 0) renderOAuthButtons();
     if (!state.user) {
         refreshWebQrLocalization();
+        if (state.inRecovery) {
+            refreshRecoveryLocalization();
+        }
     }
     if (state.user) {
         renderProfile();
@@ -221,20 +235,32 @@ function mapApiError(code) {
     if (c === 2001 || c === 2010) return t("api_2001");
     if (c === 2002 || c === 2004) return t("api_2002");
     if (c === 2005) return t("api_2005");
+    if (c === 2008) return t("api_2008");
     if (c === 2009) return t("api_2009");
     if (c === 2012) return t("api_2012");
     if (c === 2019) return t("api_2019");
+    if (c === 2020) return t("api_2020");
+    if (c === 2021) return t("api_2021");
+    if (c === 2022) return t("api_2022");
     if (c === 3001 || c === 3002 || c === 3006 || c === 3017) return t("api_3001");
     if (c === 3004 || c === 3005) return t("api_3004");
+    if (c === 3007) return t("api_3007");
+    if (c === 3008) return t("api_3008");
+    if (c === 3009) return t("api_3009");
+    if (c === 3010) return t("api_3010");
     if (c === 3018) return t("api_3018");
     if (c === 3019) return t("api_3019");
     if (c === 3020) return t("api_3020");
+    if (c === 3021) return t("api_3021");
+    if (c === 3022) return t("api_3022");
     if (c === 4001 || c === 4002 || c === 4003) return t("api_4001");
     if (c === 4006) return t("api_4006");
     if (c === 4011) return t("api_4011");
     if (c === 4012) return t("api_4012");
     if (c === 4013) return t("api_4013");
+    if (c === 4017) return t("api_4017");
     if (c === 4023) return t("api_4023");
+    if (c === 4025) return t("api_4025");
     if (c === 5001 || c === 5002 || c === 5003 || c === 5007) return t("api_5001");
     return t("api_default");
 }
@@ -529,11 +555,15 @@ function openPopupCentered(url, name, w = 520, h = 640) {
 }
 
 function stopAuthPolling() {
+    state.authChallengeGen += 1;
     if (state.authPollTimer) {
         clearInterval(state.authPollTimer);
         state.authPollTimer = null;
     }
     state.authChallengeKind = "";
+    state.authChallengeId = "";
+    state.authChallengeQrGen = null;
+    state.authChallengeQueued = false;
 }
 
 function setAuthError(msg) {
@@ -569,29 +599,55 @@ function setLoginKeyError(msg) {
     }
 }
 
+function setRecoveryError(msg) {
+    const el = $("recovery-error");
+    if (!msg) {
+        el.textContent = "";
+        el.classList.add("hidden");
+    } else {
+        el.textContent = msg;
+        el.classList.remove("hidden");
+    }
+}
+
 function setLoginFormDisabled(disabled) {
     $("login-email").disabled = disabled;
     $("login-password").disabled = disabled;
     $("btn-login-submit").disabled = disabled;
+    $("btn-open-recovery").disabled = disabled;
     $("login-2fa-code").disabled = disabled;
     $("btn-twofa-submit").disabled = disabled;
     $("btn-twofa-back").disabled = disabled;
     $("login-key-input").disabled = disabled;
     $("btn-loginkey-submit").disabled = disabled;
+    $("recovery-lookup-email").disabled = disabled;
+    $("recovery-confirm-email").disabled = disabled;
+    $("recovery-otp").disabled = disabled;
+    $("recovery-new-password").disabled = disabled;
+    $("recovery-confirm-password").disabled = disabled;
+    $("btn-recovery-submit").disabled = disabled;
+    $("btn-recovery-back").disabled = disabled;
     $("tab-auth-password").disabled = disabled;
     $("tab-auth-key").disabled = disabled;
     $("oauth-buttons").querySelectorAll("button").forEach((b) => {
         b.disabled = disabled;
     });
+    if (!disabled && state.inRecovery) {
+        updateRecoveryCooldownUi();
+    } else {
+        $("btn-recovery-resend").disabled = true;
+    }
 }
 
 function setAuthMode(mode) {
     const next = mode === "key" ? "key" : "password";
     state.authMode = next;
     state.inTwoFa = false;
+    state.inRecovery = false;
     setAuthError("");
     setTwoFaError("");
     setLoginKeyError("");
+    setRecoveryError("");
     $("auth-mode-tabs").classList.remove("hidden");
     $("tab-auth-password").classList.toggle("active", next === "password");
     $("tab-auth-password").setAttribute("aria-selected", next === "password" ? "true" : "false");
@@ -599,16 +655,20 @@ function setAuthMode(mode) {
     $("tab-auth-key").setAttribute("aria-selected", next === "key" ? "true" : "false");
     $("login-form").classList.toggle("hidden", next !== "password");
     $("twofa-form").classList.add("hidden");
+    $("recovery-form").classList.add("hidden");
     $("loginkey-form").classList.toggle("hidden", next !== "key");
 }
 
 function enterTwoFaStep() {
     state.inTwoFa = true;
+    state.inRecovery = false;
     setAuthError("");
     setTwoFaError("");
+    setRecoveryError("");
     $("auth-mode-tabs").classList.add("hidden");
     $("login-form").classList.add("hidden");
     $("loginkey-form").classList.add("hidden");
+    $("recovery-form").classList.add("hidden");
     $("twofa-form").classList.remove("hidden");
     $("login-2fa-code").value = "";
     setLoginFormDisabled(false);
@@ -619,6 +679,154 @@ function exitTwoFaStep() {
     state.inTwoFa = false;
     $("login-2fa-code").value = "";
     setTwoFaError("");
+    setAuthMode("password");
+}
+
+function getSelectedRecoveryChannel() {
+    if (!Array.isArray(state.recoveryChannels) || state.recoveryChannels.length === 0) return null;
+    const idx = Number($("recovery-channel").value || 0);
+    return state.recoveryChannels[idx] || state.recoveryChannels[0];
+}
+
+function isRecoveryLoginAction() {
+    const ch = getSelectedRecoveryChannel();
+    return Boolean(ch && ch.channel === "recovery" && $("recovery-action").value === "login");
+}
+
+function updateRecoveryCooldownUi() {
+    const rem = Math.max(0, Math.ceil((state.recoveryCooldownUntil - Date.now()) / 1000));
+    const resendBtn = $("btn-recovery-resend");
+    const submitBtn = $("btn-recovery-submit");
+    if (rem > 0) {
+        resendBtn.disabled = true;
+        resendBtn.textContent = `${rem}s`;
+        if (state.inRecovery && state.recoveryStep === 1) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = `${rem}s`;
+        }
+        return;
+    }
+    if (state.recoveryCooldownTimer) {
+        clearInterval(state.recoveryCooldownTimer);
+        state.recoveryCooldownTimer = null;
+    }
+    resendBtn.disabled = false;
+    resendBtn.textContent = t("btn_resend_code");
+    if (state.inRecovery && state.recoveryStep === 1) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = t("rec_btn_send");
+    }
+}
+
+function startRecoveryCooldown(sec = 60) {
+    state.recoveryCooldownUntil = Date.now() + Math.max(1, sec) * 1000;
+    updateRecoveryCooldownUi();
+    if (state.recoveryCooldownTimer) clearInterval(state.recoveryCooldownTimer);
+    state.recoveryCooldownTimer = setInterval(updateRecoveryCooldownUi, 500);
+}
+
+function populateRecoveryChannelOptions() {
+    const sel = $("recovery-channel");
+    const prev = sel.value;
+    sel.textContent = "";
+    state.recoveryChannels.forEach((ch, idx) => {
+        const opt = document.createElement("option");
+        opt.value = String(idx);
+        opt.textContent = ch.channel === "recovery"
+            ? t("rec_channel_recovery", { masked: ch.masked })
+            : t("rec_channel_primary", { masked: ch.masked });
+        sel.appendChild(opt);
+    });
+    if (prev && Number(prev) >= 0 && Number(prev) < state.recoveryChannels.length) {
+        sel.value = prev;
+    } else if (state.recoveryChannels.length > 0) {
+        sel.value = "0";
+    }
+    syncWinSelect(sel);
+}
+
+function syncRecoveryChannelUi(clearInput = false) {
+    const ch = getSelectedRecoveryChannel();
+    const isRec = Boolean(ch && ch.channel === "recovery");
+    $("recovery-channel-wrap").classList.toggle("hidden", state.recoveryChannels.length <= 1);
+    $("recovery-action-wrap").classList.toggle("hidden", !isRec);
+    if (!isRec) {
+        $("recovery-action").value = "reset";
+        syncWinSelect($("recovery-action"));
+    }
+    $("recovery-masked-hint").textContent = ch ? t("rec_masked_hint", { masked: ch.masked }) : "";
+    if (clearInput) {
+        $("recovery-confirm-email").value = "";
+    }
+}
+
+function setRecoveryStep(step) {
+    state.recoveryStep = step;
+    setRecoveryError("");
+    $("recovery-step-0").classList.toggle("hidden", step !== 0);
+    $("recovery-step-1").classList.toggle("hidden", step !== 1);
+    $("recovery-step-2").classList.toggle("hidden", step !== 2);
+    $("recovery-desc").classList.toggle("hidden", step !== 0);
+    const submitBtn = $("btn-recovery-submit");
+    const backBtn = $("btn-recovery-back");
+    if (step === 0) {
+        submitBtn.textContent = t("rec_btn_next");
+        submitBtn.disabled = false;
+        backBtn.textContent = t("btn_twofa_back");
+        setTimeout(() => $("recovery-lookup-email").focus(), 40);
+    } else if (step === 1) {
+        populateRecoveryChannelOptions();
+        syncRecoveryChannelUi(false);
+        submitBtn.textContent = t("rec_btn_send");
+        backBtn.textContent = t("rec_btn_prev");
+        updateRecoveryCooldownUi();
+        setTimeout(() => $("recovery-confirm-email").focus(), 40);
+    } else {
+        const ch = getSelectedRecoveryChannel();
+        const isLogin = isRecoveryLoginAction();
+        $("recovery-sent-hint").textContent = ch ? t("rec_sent_hint", { masked: ch.masked }) : "";
+        $("recovery-pwd-fields").classList.toggle("hidden", isLogin);
+        submitBtn.textContent = isLogin ? t("rec_btn_login") : t("rec_btn_reset");
+        submitBtn.disabled = false;
+        backBtn.textContent = t("rec_btn_prev");
+        updateRecoveryCooldownUi();
+        setTimeout(() => $("recovery-otp").focus(), 40);
+    }
+}
+
+function refreshRecoveryLocalization() {
+    if (!state.inRecovery) return;
+    populateRecoveryChannelOptions();
+    syncWinSelect($("recovery-action"));
+    syncRecoveryChannelUi(false);
+    setRecoveryStep(state.recoveryStep);
+}
+
+function enterRecoveryFlow() {
+    if (!state.providersAvailable) return;
+    stopAuthPolling();
+    state.inRecovery = true;
+    state.inTwoFa = false;
+    state.recoveryChannels = [];
+    state.recoveryPendingAdvance = false;
+    $("auth-mode-tabs").classList.add("hidden");
+    $("login-form").classList.add("hidden");
+    $("loginkey-form").classList.add("hidden");
+    $("twofa-form").classList.add("hidden");
+    $("recovery-form").classList.remove("hidden");
+    $("recovery-lookup-email").value = $("login-email").value.trim();
+    $("recovery-confirm-email").value = "";
+    $("recovery-otp").value = "";
+    $("recovery-new-password").value = "";
+    $("recovery-confirm-password").value = "";
+    setLoginFormDisabled(false);
+    setRecoveryStep(0);
+}
+
+function exitRecoveryFlow() {
+    state.inRecovery = false;
+    state.recoveryPendingAdvance = false;
+    setRecoveryError("");
     setAuthMode("password");
 }
 
@@ -828,7 +1036,7 @@ async function startWebQrLogin() {
         const res = await apiRequest("/web-api/auth/qr/create", { method: "POST", body: {} });
         if (gen !== state.qrGeneration || state.user) return;
         if (res.status === 202 && res.json?.data?.captcha_url) {
-            runAuthCaptchaChallenge(res.json.data.captcha_url, "qr_create", gen);
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "qr_create", gen, res.json.data.challenge_id);
             return;
         }
         if (res.ok && res.json?.ok && res.json?.data?.qr_url) {
@@ -854,6 +1062,16 @@ function handleChallengeTerminalStatus(st, kind, qrGen) {
         if (st.json.code === 102 || d.state === "two_fa_required") {
             stopAuthPolling();
             enterTwoFaStep();
+            return true;
+        }
+        if (d.state === "otp_sent") {
+            stopAuthPolling();
+            setLoginFormDisabled(false);
+            startRecoveryCooldown(60);
+            if (state.recoveryPendingAdvance) {
+                state.recoveryPendingAdvance = false;
+                setRecoveryStep(2);
+            }
             return true;
         }
         if (d.state === "qr_created" && d.qr_url) {
@@ -882,17 +1100,54 @@ function handleChallengeTerminalStatus(st, kind, qrGen) {
         }
     } else if (kind === "login_key") {
         setLoginKeyError(msg);
+    } else if (kind === "recovery_otp") {
+        state.recoveryPendingAdvance = false;
+        if (Number(code) === 3021 || Number(code) === 3022) {
+            setRecoveryStep(0);
+        }
+        setRecoveryError(msg);
     } else {
         setAuthError(msg);
     }
     return true;
 }
 
-function runAuthCaptchaChallenge(captchaUrl, kind, qrGen = null) {
+async function pollAuthChallengeOnce(fromMessage = false) {
+    if (!state.authChallengeKind) return "inactive";
+    if (state.authChallengeInFlight) {
+        if (fromMessage) state.authChallengeQueued = true;
+        return "inflight";
+    }
+    const gen = state.authChallengeGen;
+    const kind = state.authChallengeKind;
+    const qrGen = state.authChallengeQrGen;
+    state.authChallengeInFlight = true;
+    state.authChallengeQueued = false;
+    let shouldRequeue = false;
+    try {
+        const st = await apiRequest("/web-api/auth/challenge/status");
+        if (gen !== state.authChallengeGen || !state.authChallengeKind) return "stale";
+        if (handleChallengeTerminalStatus(st, kind, qrGen)) return "terminal";
+        shouldRequeue = state.authChallengeQueued && gen === state.authChallengeGen && Boolean(state.authChallengeKind);
+        return "pending";
+    } finally {
+        state.authChallengeInFlight = false;
+        state.authChallengeQueued = false;
+        if (shouldRequeue) {
+            pollAuthChallengeOnce(false).catch(() => {});
+        }
+    }
+}
+
+function runAuthCaptchaChallenge(captchaUrl, kind, qrGen = null, challengeId = "") {
     stopAuthPolling();
+    const gen = state.authChallengeGen;
     state.authChallengeKind = kind;
+    state.authChallengeId = String(challengeId || "");
+    state.authChallengeQrGen = qrGen;
     state.authPopup = openPopupCentered(captchaUrl, "osmium_captcha", 460, 520);
     if (!state.authPopup) {
+        stopAuthPolling();
         if (kind === "qr_create") {
             applyWebQrState("expired");
             showToast(t("err_popup_blocked_captcha"));
@@ -902,6 +1157,10 @@ function runAuthCaptchaChallenge(captchaUrl, kind, qrGen = null) {
         } else if (kind === "login_key") {
             setLoginKeyError(t("err_popup_blocked_captcha"));
             setLoginFormDisabled(false);
+        } else if (kind === "recovery_otp") {
+            state.recoveryPendingAdvance = false;
+            setRecoveryError(t("err_popup_blocked_captcha"));
+            setLoginFormDisabled(false);
         } else {
             setAuthError(t("err_popup_blocked_captcha"));
             setLoginFormDisabled(false);
@@ -910,8 +1169,8 @@ function runAuthCaptchaChallenge(captchaUrl, kind, qrGen = null) {
     }
     let closedTicks = 0;
     const pollChallenge = async () => {
-        const st = await apiRequest("/web-api/auth/challenge/status");
-        if (handleChallengeTerminalStatus(st, kind, qrGen)) return;
+        const outcome = await pollAuthChallengeOnce(false);
+        if (gen !== state.authChallengeGen || outcome !== "pending") return;
         if (state.authPopup && state.authPopup.closed) {
             closedTicks += 1;
             if (closedTicks >= 2) {
@@ -923,6 +1182,9 @@ function runAuthCaptchaChallenge(captchaUrl, kind, qrGen = null) {
                     setTwoFaError(t("err_captcha_closed"));
                 } else if (kind === "login_key") {
                     setLoginKeyError(t("err_captcha_closed"));
+                } else if (kind === "recovery_otp") {
+                    state.recoveryPendingAdvance = false;
+                    setRecoveryError(t("err_captcha_closed"));
                 } else {
                     setAuthError(t("err_captcha_closed"));
                 }
@@ -1066,7 +1328,7 @@ async function handleEmailLoginSubmit(e) {
             body: { email, password }
         });
         if (res.status === 202 && res.json?.data?.captcha_url) {
-            runAuthCaptchaChallenge(res.json.data.captcha_url, "login");
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "login", null, res.json.data.challenge_id);
             return;
         }
         if (res.ok && res.json?.ok && res.json?.data?.user) {
@@ -1098,7 +1360,7 @@ async function handleTwoFaSubmit(e) {
             body: { code }
         });
         if (res.status === 202 && res.json?.data?.captcha_url) {
-            runAuthCaptchaChallenge(res.json.data.captcha_url, "login_2fa");
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "login_2fa", null, res.json.data.challenge_id);
             return;
         }
         if (res.ok && res.json?.ok && res.json?.data?.user) {
@@ -1140,7 +1402,7 @@ async function handleLoginKeySubmit(e) {
             body: { login_key: loginKey }
         });
         if (res.status === 202 && res.json?.data?.captcha_url) {
-            runAuthCaptchaChallenge(res.json.data.captcha_url, "login_key");
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "login_key", null, res.json.data.challenge_id);
             return;
         }
         if (res.ok && res.json?.ok && res.json?.data?.user) {
@@ -1153,6 +1415,183 @@ async function handleLoginKeySubmit(e) {
     } catch {
         setLoginKeyError(t("err_network"));
         setLoginFormDisabled(false);
+    }
+}
+
+async function sendRecoveryOtp(advanceOnSuccess) {
+    const ch = getSelectedRecoveryChannel();
+    if (!ch) {
+        setRecoveryStep(0);
+        setRecoveryError(t("api_3021"));
+        return;
+    }
+    const confirmEmail = $("recovery-confirm-email").value.trim();
+    if (!confirmEmail || !confirmEmail.includes("@")) {
+        setRecoveryError(t("err_enter_confirm_email"));
+        $("recovery-confirm-email").focus();
+        return;
+    }
+    const isLogin = isRecoveryLoginAction();
+    stopAuthPolling();
+    setRecoveryError("");
+    state.recoveryPendingAdvance = advanceOnSuccess;
+    setLoginFormDisabled(true);
+    try {
+        const res = isLogin
+            ? await apiRequest("/web-api/auth/recovery/login/send-code", {
+                  method: "POST",
+                  body: { confirm_email: confirmEmail }
+              })
+            : await apiRequest("/web-api/auth/recovery/reset/send-code", {
+                  method: "POST",
+                  body: { channel: ch.channel, confirm_email: confirmEmail }
+              });
+        if (res.status === 202 && res.json?.data?.captcha_url) {
+            runAuthCaptchaChallenge(res.json.data.captcha_url, "recovery_otp", null, res.json.data.challenge_id);
+            return;
+        }
+        if (res.ok && res.json?.ok) {
+            state.recoveryPendingAdvance = false;
+            setLoginFormDisabled(false);
+            startRecoveryCooldown(60);
+            if (advanceOnSuccess) setRecoveryStep(2);
+            return;
+        }
+        state.recoveryPendingAdvance = false;
+        const errCode = Number(res.json?.code);
+        setLoginFormDisabled(false);
+        if (errCode === 3010) {
+            startRecoveryCooldown(60);
+            if (advanceOnSuccess) setRecoveryStep(2);
+            return;
+        }
+        if (errCode === 3021 || errCode === 3022 || res.status === 410) {
+            setRecoveryStep(0);
+        }
+        setRecoveryError(mapApiError(errCode));
+    } catch {
+        state.recoveryPendingAdvance = false;
+        setRecoveryError(t("err_network"));
+        setLoginFormDisabled(false);
+    }
+}
+
+async function handleRecoverySubmit(e) {
+    e.preventDefault();
+    if (!state.providersAvailable) return;
+    setRecoveryError("");
+    if (state.recoveryStep === 0) {
+        const email = $("recovery-lookup-email").value.trim();
+        if (!email || !email.includes("@")) {
+            setRecoveryError(t("err_enter_email"));
+            $("recovery-lookup-email").focus();
+            return;
+        }
+        setLoginFormDisabled(true);
+        try {
+            const res = await apiRequest("/web-api/auth/recovery/lookup", {
+                method: "POST",
+                body: { email }
+            });
+            setLoginFormDisabled(false);
+            if (!res.ok || !res.json?.ok || !Array.isArray(res.json?.data?.channels) || res.json.data.channels.length === 0) {
+                setRecoveryError(mapApiError(res.json?.code));
+                return;
+            }
+            state.recoveryChannels = res.json.data.channels;
+            $("recovery-confirm-email").value = "";
+            $("recovery-otp").value = "";
+            $("recovery-new-password").value = "";
+            $("recovery-confirm-password").value = "";
+            setRecoveryStep(1);
+        } catch {
+            setLoginFormDisabled(false);
+            setRecoveryError(t("err_network"));
+        }
+        return;
+    }
+
+    if (state.recoveryStep === 1) {
+        await sendRecoveryOtp(true);
+        return;
+    }
+
+    const ch = getSelectedRecoveryChannel();
+    if (!ch) {
+        setRecoveryStep(0);
+        setRecoveryError(t("api_3021"));
+        return;
+    }
+    const confirmEmail = $("recovery-confirm-email").value.trim();
+    const code = $("recovery-otp").value.replace(/\s+/g, "");
+    if (!/^\d{6}$/.test(code)) {
+        setRecoveryError(t("err_enter_otp"));
+        $("recovery-otp").focus();
+        return;
+    }
+    const isLogin = isRecoveryLoginAction();
+    if (!isLogin) {
+        const newPwd = $("recovery-new-password").value;
+        if (newPwd.length < 8 || newPwd.length > 128) {
+            setRecoveryError(t("err_password_length"));
+            $("recovery-new-password").focus();
+            return;
+        }
+        if (newPwd !== $("recovery-confirm-password").value) {
+            setRecoveryError(t("err_password_mismatch"));
+            $("recovery-confirm-password").focus();
+            return;
+        }
+    }
+    setLoginFormDisabled(true);
+    try {
+        if (isLogin) {
+            const res = await apiRequest("/web-api/auth/recovery/login/confirm", {
+                method: "POST",
+                body: { confirm_email: confirmEmail, code }
+            });
+            if (res.ok && res.json?.ok) {
+                const d = res.json.data || {};
+                if (res.json.code === 102 || d.state === "two_fa_required") {
+                    enterTwoFaStep();
+                    return;
+                }
+                if (d.user) {
+                    enterAuthenticatedApp(d);
+                    return;
+                }
+            }
+            const errCode = Number(res.json?.code);
+            setLoginFormDisabled(false);
+            if (errCode === 3021 || res.status === 410) {
+                setRecoveryStep(0);
+            }
+            setRecoveryError(mapApiError(errCode));
+        } else {
+            const res = await apiRequest("/web-api/auth/recovery/reset/confirm", {
+                method: "POST",
+                body: {
+                    channel: ch.channel,
+                    confirm_email: confirmEmail,
+                    code,
+                    new_password: $("recovery-new-password").value
+                }
+            });
+            setLoginFormDisabled(false);
+            if (res.ok && res.json?.ok) {
+                exitRecoveryFlow();
+                showToast(t("toast_password_reset"));
+                return;
+            }
+            const errCode = Number(res.json?.code);
+            if (errCode === 3021 || res.status === 410) {
+                setRecoveryStep(0);
+            }
+            setRecoveryError(mapApiError(errCode));
+        }
+    } catch {
+        setLoginFormDisabled(false);
+        setRecoveryError(t("err_network"));
     }
 }
 
@@ -1244,6 +1683,16 @@ function renderProfile() {
     $("nav-account-label").textContent = u.username || t("nav_account");
     $("profile-username").textContent = u.username || "Osmium";
     $("profile-email").textContent = u.email || t("account_no_email");
+    const recEl = $("profile-recovery-email");
+    if (recEl) {
+        if (u.has_recovery_email && u.recovery_email) {
+            recEl.textContent = t("account_recovery_email_label", { email: u.recovery_email });
+            recEl.classList.remove("hidden");
+        } else {
+            recEl.textContent = "";
+            recEl.classList.add("hidden");
+        }
+    }
     const badge = $("profile-status-badge");
     if (u.locked) {
         badge.textContent = t("account_status_locked");
@@ -2183,6 +2632,20 @@ function bindGlobalUi() {
     $("login-form").onsubmit = handleEmailLoginSubmit;
     $("twofa-form").onsubmit = handleTwoFaSubmit;
     $("loginkey-form").onsubmit = handleLoginKeySubmit;
+    $("recovery-form").onsubmit = handleRecoverySubmit;
+    $("btn-open-recovery").onclick = () => enterRecoveryFlow();
+    $("btn-recovery-back").onclick = () => {
+        if (state.recoveryStep > 0) {
+            setRecoveryStep(state.recoveryStep - 1);
+        } else {
+            exitRecoveryFlow();
+        }
+    };
+    $("recovery-channel").onchange = () => syncRecoveryChannelUi(true);
+    $("btn-recovery-resend").onclick = () => sendRecoveryOtp(false);
+    $("recovery-otp").addEventListener("input", (e) => {
+        e.target.value = e.target.value.replace(/\D/g, "").slice(0, 6);
+    });
     $("btn-twofa-back").onclick = () => exitTwoFaStep();
     $("tab-auth-password").onclick = () => setAuthMode("password");
     $("tab-auth-key").onclick = () => setAuthMode("key");
@@ -2499,7 +2962,12 @@ function bindGlobalUi() {
             await pollOAuthStatusOnce();
             return;
         }
-        if (e.origin !== "https://osmium.fufu.skin") return;
+        const allowedCaptchaOrigins = new Set(["https://osmium.fufu.skin"]);
+        try {
+            const su = new URL(state.signalingUrl);
+            allowedCaptchaOrigins.add(`${su.protocol === "ws:" ? "http:" : "https:"}//${su.host}`);
+        } catch {}
+        if (!allowedCaptchaOrigins.has(e.origin)) return;
         if (e.data.type === "osmium-captcha-done") {
             if (state.pendingCaptchaContext) {
                 const retryOpts = state.pendingCaptchaContext;
@@ -2512,9 +2980,11 @@ function bindGlobalUi() {
                 }
                 return;
             }
-            const kind = state.authChallengeKind || "login";
-            const st = await apiRequest("/web-api/auth/challenge/status");
-            handleChallengeTerminalStatus(st, kind, state.qrGeneration);
+            if (!state.authChallengeKind) return;
+            if (e.data.challengeId && state.authChallengeId && String(e.data.challengeId) !== state.authChallengeId) {
+                return;
+            }
+            await pollAuthChallengeOnce(true);
         }
     });
 }
